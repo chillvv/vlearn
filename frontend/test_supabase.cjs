@@ -1,0 +1,3 @@
+const { createClient } = require('@supabase/supabase-js');
+const supabase = createClient('https://kepmdwisavomgrksvgff.supabase.co', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtlcG1kd2lzYXZvbWdya3N2Z2ZmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM3NTc1NDUsImV4cCI6MjA4OTMzMzU0NX0.Q0xU709C6boLIvDE_fWNex8477edSF-ehpicLQY0xiM');
+supabase.from('questions').select('knowledge_point').then(res => console.log(res.data));

@@ -20,9 +20,22 @@ app.use(
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-const DOUBAO_API_KEY = Deno.env.get("DOUBAO_API_KEY");
-const DOUBAO_MODEL = Deno.env.get("DOUBAO_MODEL") || "doubao-pro-32k";
-const DOUBAO_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3";
+const DASHSCOPE_API_KEY = Deno.env.get("DASHSCOPE_API_KEY");
+const QWEN_MODEL = Deno.env.get("QWEN_MODEL") || "qwen3.5-flash";
+const QWEN_BASE_URL = Deno.env.get("QWEN_BASE_URL") || "https://dashscope.aliyuncs.com/compatible-mode/v1";
+
+function fail(c: any, status: number, code: string, message: string, details?: unknown) {
+  return c.json({
+    success: false,
+    error: {
+      code,
+      message,
+      details,
+    },
+    timestamp: new Date().toISOString(),
+    path: c.req.path,
+  }, status);
+}
 
 // ---- Auth helpers ----
 async function getUserId(c: any): Promise<string | null> {
@@ -96,8 +109,8 @@ app.get("/make-server-794e3fa7/health", (c) => c.json({ status: "ok", timestamp:
 app.post("/make-server-794e3fa7/auth/register", async (c) => {
   try {
     const { email, password, name } = await c.req.json();
-    if (!email || !password) return c.json({ error: "邮箱和密码不能为空" }, 400);
-    if (password.length < 6) return c.json({ error: "密码至少需要6位" }, 400);
+    if (!email || !password) return fail(c, 400, "VALIDATION_ERROR", "邮箱和密码不能为空");
+    if (password.length < 6) return fail(c, 400, "VALIDATION_ERROR", "密码至少需要6位");
 
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
     const { data, error } = await supabase.auth.admin.createUser({
@@ -106,11 +119,11 @@ app.post("/make-server-794e3fa7/auth/register", async (c) => {
       user_metadata: { name: name || email.split("@")[0] },
       email_confirm: true,
     });
-    if (error) return c.json({ error: error.message }, 400);
+    if (error) return fail(c, 400, "AUTH_REGISTER_FAILED", error.message);
     return c.json({ user: data.user }, 201);
   } catch (err) {
     console.log("Register error:", err);
-    return c.json({ error: `注册失败: ${err}` }, 500);
+    return fail(c, 500, "INTERNAL_ERROR", "注册失败", String(err));
   }
 });
 
@@ -118,19 +131,19 @@ app.post("/make-server-794e3fa7/auth/register", async (c) => {
 app.get("/make-server-794e3fa7/questions", async (c) => {
   try {
     const userId = await getUserId(c);
-    if (!userId) return c.json({ error: "未登录" }, 401);
+    if (!userId) return fail(c, 401, "UNAUTHORIZED", "未登录");
     const questions = await kv.getByPrefix(`q:${userId}:`);
     return c.json({ questions: questions || [] });
   } catch (err) {
     console.log("Get questions error:", err);
-    return c.json({ error: `获取错题失败: ${err}` }, 500);
+    return fail(c, 500, "INTERNAL_ERROR", "获取错题失败", String(err));
   }
 });
 
 app.post("/make-server-794e3fa7/questions", async (c) => {
   try {
     const userId = await getUserId(c);
-    if (!userId) return c.json({ error: "未登录" }, 401);
+    if (!userId) return fail(c, 401, "UNAUTHORIZED", "未登录");
     const body = await c.req.json();
     const id = crypto.randomUUID();
     const now = new Date().toISOString();
@@ -160,37 +173,37 @@ app.post("/make-server-794e3fa7/questions", async (c) => {
     return c.json({ question }, 201);
   } catch (err) {
     console.log("Create question error:", err);
-    return c.json({ error: `保存错题失败: ${err}` }, 500);
+    return fail(c, 500, "INTERNAL_ERROR", "保存错题失败", String(err));
   }
 });
 
 app.put("/make-server-794e3fa7/questions/:id", async (c) => {
   try {
     const userId = await getUserId(c);
-    if (!userId) return c.json({ error: "未登录" }, 401);
+    if (!userId) return fail(c, 401, "UNAUTHORIZED", "未登录");
     const id = c.req.param("id");
     const existing = await kv.get(`q:${userId}:${id}`);
-    if (!existing) return c.json({ error: "错题不存在" }, 404);
+    if (!existing) return fail(c, 404, "NOT_FOUND", "错题不存在");
     const body = await c.req.json();
     const updated = { ...existing, ...body, id, userId, updatedAt: new Date().toISOString() };
     await kv.set(`q:${userId}:${id}`, updated);
     return c.json({ question: updated });
   } catch (err) {
     console.log("Update question error:", err);
-    return c.json({ error: `更新错题失败: ${err}` }, 500);
+    return fail(c, 500, "INTERNAL_ERROR", "更新错题失败", String(err));
   }
 });
 
 app.delete("/make-server-794e3fa7/questions/:id", async (c) => {
   try {
     const userId = await getUserId(c);
-    if (!userId) return c.json({ error: "未登录" }, 401);
+    if (!userId) return fail(c, 401, "UNAUTHORIZED", "未登录");
     const id = c.req.param("id");
     await kv.del(`q:${userId}:${id}`);
     return c.json({ success: true });
   } catch (err) {
     console.log("Delete question error:", err);
-    return c.json({ error: `删除错题失败: ${err}` }, 500);
+    return fail(c, 500, "INTERNAL_ERROR", "删除错题失败", String(err));
   }
 });
 
@@ -198,7 +211,7 @@ app.delete("/make-server-794e3fa7/questions/:id", async (c) => {
 app.get("/make-server-794e3fa7/questions/review", async (c) => {
   try {
     const userId = await getUserId(c);
-    if (!userId) return c.json({ error: "未登录" }, 401);
+    if (!userId) return fail(c, 401, "UNAUTHORIZED", "未登录");
     const today = new Date().toISOString().split("T")[0];
     const allQuestions = await kv.getByPrefix(`q:${userId}:`);
     const due = (allQuestions || []).filter((q: any) => q.nextReview <= today);
@@ -207,7 +220,7 @@ app.get("/make-server-794e3fa7/questions/review", async (c) => {
     return c.json({ questions: due, total: due.length });
   } catch (err) {
     console.log("Get review questions error:", err);
-    return c.json({ error: `获取复习题目失败: ${err}` }, 500);
+    return fail(c, 500, "INTERNAL_ERROR", "获取复习题目失败", String(err));
   }
 });
 
@@ -215,11 +228,11 @@ app.get("/make-server-794e3fa7/questions/review", async (c) => {
 app.post("/make-server-794e3fa7/questions/:id/review", async (c) => {
   try {
     const userId = await getUserId(c);
-    if (!userId) return c.json({ error: "未登录" }, 401);
+    if (!userId) return fail(c, 401, "UNAUTHORIZED", "未登录");
     const id = c.req.param("id");
     const { isCorrect } = await c.req.json();
     const question = await kv.get(`q:${userId}:${id}`);
-    if (!question) return c.json({ error: "错题不存在" }, 404);
+    if (!question) return fail(c, 404, "NOT_FOUND", "错题不存在");
     const { newMastery, nextReview } = calculateNextReview(isCorrect, question.masteryLevel || 0);
     const updated = {
       ...question,
@@ -233,7 +246,7 @@ app.post("/make-server-794e3fa7/questions/:id/review", async (c) => {
     return c.json({ question: updated });
   } catch (err) {
     console.log("Review submit error:", err);
-    return c.json({ error: `提交复习结果失败: ${err}` }, 500);
+    return fail(c, 500, "INTERNAL_ERROR", "提交复习结果失败", String(err));
   }
 });
 
@@ -241,7 +254,7 @@ app.post("/make-server-794e3fa7/questions/:id/review", async (c) => {
 app.get("/make-server-794e3fa7/stats", async (c) => {
   try {
     const userId = await getUserId(c);
-    if (!userId) return c.json({ error: "未登录" }, 401);
+    if (!userId) return fail(c, 401, "UNAUTHORIZED", "未登录");
     const today = new Date().toISOString().split("T")[0];
     const allQuestions = await kv.getByPrefix(`q:${userId}:`);
     const questions: any[] = allQuestions || [];
@@ -263,7 +276,7 @@ app.get("/make-server-794e3fa7/stats", async (c) => {
     return c.json({ total, dueToday, avgMastery, subjectCounts, newThisWeek, recent });
   } catch (err) {
     console.log("Stats error:", err);
-    return c.json({ error: `获取统计数据失败: ${err}` }, 500);
+    return fail(c, 500, "INTERNAL_ERROR", "获取统计数据失败", String(err));
   }
 });
 
@@ -271,32 +284,33 @@ app.get("/make-server-794e3fa7/stats", async (c) => {
 app.post("/make-server-794e3fa7/chat/stream", async (c) => {
   try {
     const userId = await getUserId(c);
-    if (!userId) return c.json({ error: "未登录" }, 401);
-    if (!DOUBAO_API_KEY) {
-      return c.json({ error: "豆包API密钥未配置，请在后台设置 DOUBAO_API_KEY 环境变量" }, 500);
+    if (!userId) return fail(c, 401, "UNAUTHORIZED", "未登录");
+    if (!DASHSCOPE_API_KEY) {
+      return fail(c, 500, "CONFIG_ERROR", "DashScope API密钥未配置，请在后台设置 DASHSCOPE_API_KEY 环境变量");
     }
     const { messages } = await c.req.json();
     if (!messages || !Array.isArray(messages)) {
-      return c.json({ error: "消息格式错误" }, 400);
+      return fail(c, 400, "VALIDATION_ERROR", "消息格式错误");
     }
-    const upstream = await fetch(`${DOUBAO_BASE_URL}/chat/completions`, {
+    const upstream = await fetch(`${QWEN_BASE_URL}/chat/completions`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${DOUBAO_API_KEY}`,
+        "Authorization": `Bearer ${DASHSCOPE_API_KEY}`,
       },
       body: JSON.stringify({
-        model: DOUBAO_MODEL,
+        model: QWEN_MODEL,
         messages: [{ role: "system", content: AI_SYSTEM_PROMPT }, ...messages],
         stream: true,
         temperature: 0.7,
         max_tokens: 2000,
+        enable_thinking: true,
       }),
     });
     if (!upstream.ok) {
       const errText = await upstream.text();
-      console.log("Doubao API error:", upstream.status, errText);
-      return c.json({ error: `豆包API错误 (${upstream.status}): ${errText}` }, 500);
+      console.log("Qwen API error:", upstream.status, errText);
+      return fail(c, 500, "UPSTREAM_ERROR", `Qwen API错误 (${upstream.status})`, errText);
     }
     return new Response(upstream.body, {
       headers: {
@@ -309,7 +323,7 @@ app.post("/make-server-794e3fa7/chat/stream", async (c) => {
     });
   } catch (err) {
     console.log("Chat stream error:", err);
-    return c.json({ error: `AI聊天失败: ${err}` }, 500);
+    return fail(c, 500, "INTERNAL_ERROR", "AI聊天失败", String(err));
   }
 });
 
@@ -317,7 +331,7 @@ app.post("/make-server-794e3fa7/chat/stream", async (c) => {
 app.get("/make-server-794e3fa7/export", async (c) => {
   try {
     const userId = await getUserId(c);
-    if (!userId) return c.json({ error: "未登录" }, 401);
+    if (!userId) return fail(c, 401, "UNAUTHORIZED", "未登录");
     const questions = await kv.getByPrefix(`q:${userId}:`);
     const exportData = {
       version: "1.0",
@@ -335,16 +349,16 @@ app.get("/make-server-794e3fa7/export", async (c) => {
     });
   } catch (err) {
     console.log("Export error:", err);
-    return c.json({ error: `导出失败: ${err}` }, 500);
+    return fail(c, 500, "INTERNAL_ERROR", "导出失败", String(err));
   }
 });
 
 app.post("/make-server-794e3fa7/import", async (c) => {
   try {
     const userId = await getUserId(c);
-    if (!userId) return c.json({ error: "未登录" }, 401);
+    if (!userId) return fail(c, 401, "UNAUTHORIZED", "未登录");
     const { questions, mergeMode } = await c.req.json();
-    if (!Array.isArray(questions)) return c.json({ error: "无效的导入格式" }, 400);
+    if (!Array.isArray(questions)) return fail(c, 400, "VALIDATION_ERROR", "无效的导入格式");
     if (mergeMode === "replace") {
       const existing = await kv.getByPrefix(`q:${userId}:`);
       if (existing && existing.length > 0) {
@@ -372,7 +386,7 @@ app.post("/make-server-794e3fa7/import", async (c) => {
     return c.json({ imported: imported.length });
   } catch (err) {
     console.log("Import error:", err);
-    return c.json({ error: `导入失败: ${err}` }, 500);
+    return fail(c, 500, "INTERNAL_ERROR", "导入失败", String(err));
   }
 });
 
@@ -380,7 +394,7 @@ app.post("/make-server-794e3fa7/import", async (c) => {
 app.post("/make-server-794e3fa7/share", async (c) => {
   try {
     const userId = await getUserId(c);
-    if (!userId) return c.json({ error: "未登录" }, 401);
+    if (!userId) return fail(c, 401, "UNAUTHORIZED", "未登录");
     const { questionIds } = await c.req.json();
     const allQ = await kv.getByPrefix(`q:${userId}:`);
     let toShare: any[] = allQ || [];
@@ -399,7 +413,7 @@ app.post("/make-server-794e3fa7/share", async (c) => {
     return c.json({ shareCode: code, count: toShare.length });
   } catch (err) {
     console.log("Share error:", err);
-    return c.json({ error: `分享失败: ${err}` }, 500);
+    return fail(c, 500, "INTERNAL_ERROR", "分享失败", String(err));
   }
 });
 
@@ -407,10 +421,10 @@ app.get("/make-server-794e3fa7/share/:code", async (c) => {
   try {
     const code = c.req.param("code").toUpperCase();
     const shareData = await kv.get(`share:${code}`);
-    if (!shareData) return c.json({ error: "分享码不存在或已过期" }, 404);
+    if (!shareData) return fail(c, 404, "NOT_FOUND", "分享码不存在或已过期");
     if (new Date(shareData.expiresAt) < new Date()) {
       await kv.del(`share:${code}`);
-      return c.json({ error: "分享码已过期" }, 404);
+      return fail(c, 404, "NOT_FOUND", "分享码已过期");
     }
     return c.json({
       questions: shareData.questions,
@@ -419,7 +433,7 @@ app.get("/make-server-794e3fa7/share/:code", async (c) => {
     });
   } catch (err) {
     console.log("Get share error:", err);
-    return c.json({ error: `获取分享内容失败: ${err}` }, 500);
+    return fail(c, 500, "INTERNAL_ERROR", "获取分享内容失败", String(err));
   }
 });
 
