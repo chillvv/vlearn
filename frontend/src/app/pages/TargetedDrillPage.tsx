@@ -2,10 +2,11 @@ import { useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router';
 import { questionsApi } from '../lib/api';
 import type { Subject, VariantQuestion } from '../lib/types';
-import { Brain, Dice5, Flame, Target, Sparkles, Clock, ArrowRight, BookOpen, Calculator, BarChart3, X, Lightbulb, CheckCircle2, ChevronRight, TrendingUp } from 'lucide-react';
+import { Dice5, Flame, Target, Sparkles, Clock, BookOpen, Calculator, BarChart3, X, Lightbulb, CheckCircle2, ChevronRight, TrendingUp } from 'lucide-react';
 import { Slider } from '../components/ui/slider';
-import { Tabs, TabsList, TabsTrigger, TabsContent } from '../components/ui/tabs';
+import { Tabs, TabsList, TabsTrigger } from '../components/ui/tabs';
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription } from '../components/ui/sheet';
+import { toast } from 'sonner';
 
 type DrillStatus = 'configuring' | 'ready' | 'loading' | 'active' | 'completed';
 
@@ -18,6 +19,7 @@ type DrillConfig = {
 
 type PresetState = {
   preset?: Partial<DrillConfig>;
+  autoStart?: boolean;
 };
 
 const defaultConfig: DrillConfig = {
@@ -33,10 +35,11 @@ const getMockMastery = (node: string) => {
   return (hash % 60) + 30; // 30% to 90%
 };
 
-const getMasteryColor = (mastery: number) => {
-  if (mastery < 50) return 'text-destructive bg-destructive/10 border-destructive/20';
-  if (mastery < 80) return 'text-amber-600 bg-amber-500/10 border-amber-500/20';
-  return 'text-emerald-600 bg-emerald-500/10 border-emerald-500/20';
+const normalizeAnswerText = (value: string) => value.trim().replace(/\s+/g, ' ').toLowerCase();
+
+const inferChoiceAnswer = (value: string) => {
+  const match = value.match(/答案\s*[:：]?\s*([A-H])/i);
+  return match?.[1]?.toUpperCase() || '';
 };
 
 export function TargetedDrillPage() {
@@ -55,6 +58,8 @@ export function TargetedDrillPage() {
   const [isExplanationOpen, setIsExplanationOpen] = useState(false);
   const [showAiHint, setShowAiHint] = useState(false);
   const [isAnswerSubmitted, setIsAnswerSubmitted] = useState(false);
+  const [autoStarted, setAutoStarted] = useState(false);
+  const [confirmExit, setConfirmExit] = useState(false);
 
   useEffect(() => {
     let timer: any;
@@ -71,24 +76,27 @@ export function TargetedDrillPage() {
   };
 
   const handleExit = () => {
-    if (window.confirm('当前进度将不会保存，确定要退出练习吗？')) {
-      setStatus('configuring');
-    }
+    setStatus('configuring');
+    setConfirmExit(false);
   };
 
   useEffect(() => {
     const load = async () => {
-      const qs = await questionsApi.getAll({ subject: config.subject });
-      const nodesSet = Array.from(new Set(qs.map(item => item.node || item.knowledge_point).filter(Boolean)));
-      const nodesWithMastery = nodesSet.map(n => ({
-        name: n,
-        mastery: getMockMastery(n)
-      })).sort((a, b) => a.mastery - b.mastery);
-      setAllNodes(nodesWithMastery);
-      
-      // Auto-select lowest mastery node if none selected
-      if (config.nodes.length === 0 && nodesWithMastery.length > 0) {
-        setConfig(prev => ({ ...prev, nodes: [nodesWithMastery[0].name] }));
+      try {
+        const qs = await questionsApi.getAll({ subject: config.subject });
+        const nodesSet = Array.from(new Set(qs.map(item => item.node || item.knowledge_point).filter(Boolean)));
+        const nodesWithMastery = nodesSet.map(n => ({
+          name: n,
+          mastery: getMockMastery(n)
+        })).sort((a, b) => a.mastery - b.mastery);
+        setAllNodes(nodesWithMastery);
+        
+        if (config.nodes.length === 0 && nodesWithMastery.length > 0) {
+          setConfig(prev => ({ ...prev, nodes: [nodesWithMastery[0].name] }));
+        }
+      } catch (error: any) {
+        toast.error(error?.message || '加载错题知识点失败');
+        setAllNodes([]);
       }
     };
     void load();
@@ -105,7 +113,11 @@ export function TargetedDrillPage() {
   }, [state.preset]);
 
   const currentQuestion = questions[currentIdx];
-  const progress = questions.length > 0 ? `${currentIdx + 1}/${questions.length}` : '0/0';
+  const effectiveCorrectAnswer = useMemo(() => {
+    if (!currentQuestion) return '';
+    const inferred = inferChoiceAnswer(currentQuestion.explanation || '');
+    return inferred || currentQuestion.correct_answer || '';
+  }, [currentQuestion]);
 
   const canGenerate = useMemo(
     () => config.nodes.length > 0 && config.amount > 0 && status !== 'loading',
@@ -126,13 +138,24 @@ export function TargetedDrillPage() {
 
   const startGenerate = async () => {
     setStatus('loading');
-    const data = await questionsApi.generateVariants(config.subject, config.nodes, config.amount, config.strategy);
-    setQuestions(data.variants);
-    setCurrentIdx(0);
-    setSelectedOption('');
-    setCorrectCount(0);
-    setStatus('active');
+    try {
+      const data = await questionsApi.generateVariants(config.subject, config.nodes, config.amount, config.strategy);
+      setQuestions(data.variants);
+      setCurrentIdx(0);
+      setSelectedOption('');
+      setCorrectCount(0);
+      setStatus('active');
+    } catch (error: any) {
+      toast.error(error?.message || '组卷失败，请稍后重试');
+      setStatus('ready');
+    }
   };
+
+  useEffect(() => {
+    if (!state.autoStart || autoStarted || status !== 'ready' || config.nodes.length === 0) return;
+    setAutoStarted(true);
+    void startGenerate();
+  }, [state.autoStart, autoStarted, status, config.nodes.length, config.subject, config.amount, config.strategy]);
 
   const submitCurrent = () => {
     if (!currentQuestion || !selectedOption) return;
@@ -140,7 +163,13 @@ export function TargetedDrillPage() {
     if (!isAnswerSubmitted) {
       // First click: submit answer and show explanation
       setIsAnswerSubmitted(true);
-      const isCorrect = selectedOption === currentQuestion.correct_answer;
+      const questionType = currentQuestion.question_type || (currentQuestion.options.length > 1 ? 'choice' : 'essay');
+      const answer = normalizeAnswerText(selectedOption);
+      const normalizedCorrect = normalizeAnswerText(currentQuestion.correct_answer || '');
+      const acceptable = (currentQuestion.acceptable_answers || []).map((item) => normalizeAnswerText(item));
+      const isCorrect = questionType === 'choice'
+        ? selectedOption === effectiveCorrectAnswer
+        : (answer.length > 0 && (answer === normalizedCorrect || acceptable.includes(answer)));
       if (isCorrect) setCorrectCount(prev => prev + 1);
       setIsExplanationOpen(true);
       return;
@@ -181,9 +210,17 @@ export function TargetedDrillPage() {
         {/* Header */}
         <header className="flex items-center justify-between shrink-0">
           <div className="flex items-center gap-4">
-            <button onClick={handleExit} className="p-2 hover:bg-secondary/20 rounded-full transition-colors text-muted-foreground hover:text-foreground">
-              <X className="h-5 w-5" />
-            </button>
+            {confirmExit ? (
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-medium text-rose-500">确定退出？</span>
+                <button onClick={handleExit} className="rounded-lg bg-rose-500 px-3 py-1.5 text-xs font-bold text-white hover:bg-rose-600 transition-colors">确认</button>
+                <button onClick={() => setConfirmExit(false)} className="rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50 transition-colors">取消</button>
+              </div>
+            ) : (
+              <button onClick={() => setConfirmExit(true)} className="p-2 hover:bg-secondary/20 rounded-full transition-colors text-muted-foreground hover:text-foreground">
+                <X className="h-5 w-5" />
+              </button>
+            )}
             <div className="h-4 w-[1px] bg-border" />
             <span className="text-sm font-semibold text-foreground">专项练习</span>
           </div>
@@ -210,15 +247,16 @@ export function TargetedDrillPage() {
         {/* Core Content Area */}
         <section className="flex-1 overflow-y-auto custom-scrollbar pr-2 pb-24">
           <div className="space-y-8 mt-4">
-            <p className="text-xl font-medium text-foreground leading-relaxed tracking-wide">
+            <p className="text-xl font-medium text-foreground leading-relaxed tracking-wide whitespace-pre-wrap">
               {currentQuestion.question_text}
             </p>
             
-            <div className="grid gap-3">
-              {currentQuestion.options.map((item, idx) => {
+            {(currentQuestion.question_type === 'choice' || currentQuestion.options.length > 1) ? (
+              <div className="grid gap-3">
+                {currentQuestion.options.map((item, idx) => {
                 const value = String.fromCharCode(65 + idx);
                 const active = selectedOption === value;
-                const isCorrectOption = value === currentQuestion.correct_answer;
+                const isCorrectOption = value === effectiveCorrectAnswer;
                 
                 let btnClass = 'border-transparent bg-secondary/10 text-foreground hover:bg-secondary/20 hover:border-secondary/30';
                 if (active) {
@@ -248,14 +286,23 @@ export function TargetedDrillPage() {
                       <span className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold ${active && !isAnswerSubmitted ? 'bg-primary text-primary-foreground' : 'bg-background border shadow-sm group-hover:border-primary/50'}`}>
                         {value}
                       </span>
-                      {item.replace(/^[A-D]\.\s*/, '')}
+                      {item.replace(/^[A-H]\.\s*/, '')}
                     </span>
                     {isAnswerSubmitted && isCorrectOption && <CheckCircle2 className="h-6 w-6 text-emerald-500" />}
                     {isAnswerSubmitted && active && !isCorrectOption && <X className="h-6 w-6 text-destructive" />}
                   </button>
                 );
-              })}
-            </div>
+                })}
+              </div>
+            ) : (
+              <textarea
+                value={selectedOption}
+                onChange={(event) => setSelectedOption(event.target.value)}
+                disabled={isAnswerSubmitted}
+                placeholder="请输入你的答案"
+                className="min-h-[140px] w-full rounded-2xl border-2 border-secondary/30 bg-card p-4 text-base leading-relaxed text-foreground outline-none transition-all focus:border-primary/40 focus:ring-2 focus:ring-primary/10 disabled:opacity-60"
+              />
+            )}
             
             {showAiHint && !isAnswerSubmitted && (
               <div className="mt-6 p-4 rounded-xl bg-indigo-50 border border-indigo-100 flex gap-3 animate-in fade-in slide-in-from-top-4">
@@ -332,7 +379,7 @@ export function TargetedDrillPage() {
                 <div className="p-4 rounded-xl bg-secondary/10 text-sm leading-relaxed text-foreground space-y-2">
                   <p>1. {currentQuestion.explanation || '分析题干提取关键信息。'}</p>
                   <p>2. 对比各个选项的差异点。</p>
-                  <p>3. 得出最终结论为 {currentQuestion.correct_answer}。</p>
+                  <p>3. 得出最终结论为 {effectiveCorrectAnswer || currentQuestion.correct_answer}。</p>
                 </div>
               </div>
               
@@ -413,7 +460,6 @@ export function TargetedDrillPage() {
               <div className="flex flex-wrap gap-3">
                 {allNodes.map(({name, mastery}) => {
                   const active = config.nodes.includes(name);
-                  const colorClass = getMasteryColor(mastery);
                   
                   return (
                     <button

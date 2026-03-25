@@ -1,303 +1,569 @@
-import { useMemo, useState } from 'react';
-import { AlertCircle, Check, ImagePlus, Send, Sparkles, Wand2 } from 'lucide-react';
+import { useState, useEffect, useRef } from 'react';
+import { ImagePlus, Send, Sparkles, X, FileText, CheckCircle, GraduationCap, BrainCircuit, ChevronDown, ChevronRight } from 'lucide-react';
+import { useNavigate } from 'react-router';
+import { buildCopilotLearningProfile, chatApi, questionsApi } from '../lib/api';
+import { approveNewTags, getCanonicalTagDictionary, normalizeMistakeDraft, parseCopilotAction, stripActionBlock, type CopilotActionProposal } from '../lib/copilot';
+import type { Question } from '../lib/types';
+import { toast } from 'sonner';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { BlockMath } from 'react-katex';
-import { questionsApi } from '../lib/api';
-import { toast } from 'sonner';
+import remarkMath from 'remark-math';
+import rehypeKatex from 'rehype-katex';
 import 'katex/dist/katex.min.css';
 
-type Step = {
-  step: number;
-  title: string;
+type DraftChatMessage = {
+  role: 'assistant' | 'user';
   content: string;
+  image?: string;
+  action?: CopilotActionProposal;
+  draft?: Partial<Question>;
+  isError?: boolean;
+  originalAsk?: string;
+  reasoningContent?: string;
 };
 
-type StructuredDraft = {
-  subject: string;
-  question_text: string;
-  core_reason: string;
-  detailed_steps: Step[];
-  formula_or_rule: string | null;
-  prerequisite_knowledge: { title: string; content: string } | null;
-  warning_tags: string[];
-  original_image_url: string | null;
-};
-
-const QUICK_COMMANDS = ['只保留核心步骤', '换个更易懂的口诀', '纠正：这题其实考的是定语从句'];
-
-function createInitialDraft(questionText: string, imageUrl: string | null): StructuredDraft {
-  return {
-    subject: '英语',
-    question_text: questionText || '请粘贴或上传题目后生成草稿',
-    core_reason: '长难句结构拆解错误',
-    detailed_steps: [
-      { step: 1, title: '定位主干', content: '先找到主语、谓语和宾语，排除插入成分干扰。' },
-      { step: 2, title: '识别从句', content: '判断定语从句修饰对象，再验证先行词与关系词匹配。' },
-      { step: 3, title: '回到选项对比', content: '逐项比对时态与语义一致性，排除过度推理项。' },
-    ],
-    formula_or_rule: '$$先抓主干\\rightarrow再拆从句\\rightarrow最后校验选项$$',
-    prerequisite_knowledge: {
-      title: '倒装句的 4 种形态',
-      content: `| 类型 | 触发词 | 结构示例 |\n| --- | --- | --- |\n| 否定副词前置 | never, seldom | Never **have I seen**... |\n| only+状语前置 | only then | Only then **did he**... |\n| so/such 前置 | so + adj | So difficult **was it**... |`,
-    },
-    warning_tags: ['主谓一致', '关系词误选'],
-    original_image_url: imageUrl,
+type PendingTagConfirm = {
+  action: CopilotActionProposal;
+  draft?: Partial<Question>;
+  additions: {
+    knowledge_point: string[];
+    ability: string[];
+    error_type: string[];
   };
-}
+};
 
-function applyCommand(draft: StructuredDraft, command: string): StructuredDraft {
-  if (command.includes('只保留核心步骤')) {
-    return { ...draft, detailed_steps: draft.detailed_steps.slice(0, 2) };
-  }
-  if (command.includes('更易懂')) {
-    return {
-      ...draft,
-      formula_or_rule: '$$先看主谓\\Rightarrow再看从句\\Rightarrow最后选最稳答案$$',
-      core_reason: '先行词定位不稳定',
-    };
-  }
-  if (command.includes('定语从句')) {
-    return {
-      ...draft,
-      core_reason: '定语从句先行词判断偏差',
-      warning_tags: ['先行词定位', '关系代词选择'],
-    };
-  }
-  return draft;
-}
-
-function stripMathWrapper(input: string) {
-  return input.replace(/^\$\$([\s\S]*)\$\$$/, '$1').replace(/^\\\(([\s\S]*)\\\)$/, '$1').trim();
-}
+const SUGGESTIONS = [
+  { icon: <ImagePlus className="h-5 w-5 text-indigo-500" />, text: '上传错题图片并解析' },
+  { icon: <CheckCircle className="h-5 w-5 text-emerald-500" />, text: '帮我归纳常见错因' },
+  { icon: <FileText className="h-5 w-5 text-blue-500" />, text: '帮我生成今天的复习计划' },
+  { icon: <GraduationCap className="h-5 w-5 text-purple-500" />, text: '给我 10 道同类练习' },
+];
 
 export function DraftReviewPage() {
-  const [questionText, setQuestionText] = useState('');
+  const navigate = useNavigate();
+  const [dictionary, setDictionary] = useState(getCanonicalTagDictionary());
+  const [messages, setMessages] = useState<DraftChatMessage[]>([]);
+  const [input, setInput] = useState('');
   const [imagePreview, setImagePreview] = useState<string | null>(null);
-  const [draft, setDraft] = useState<StructuredDraft | null>(null);
-  const [command, setCommand] = useState('');
-  const [userNote, setUserNote] = useState('');
-  const [saving, setSaving] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [draftEdits, setDraftEdits] = useState<Record<number, Partial<Question>>>({});
+  const [pendingTagConfirm, setPendingTagConfirm] = useState<PendingTagConfirm | null>(null);
+  const [deepThinking, setDeepThinking] = useState(false);
+  const [expandedThinking, setExpandedThinking] = useState<Record<number, boolean>>({});
+  
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  const canSave = Boolean(draft?.question_text && draft?.core_reason);
+  const adjustHeight = () => {
+    const textarea = textareaRef.current;
+    if (textarea) {
+      textarea.style.height = 'auto';
+      textarea.style.height = `${Math.min(textarea.scrollHeight, 200)}px`;
+    }
+  };
 
-  const enhancedImage = useMemo(() => {
-    if (!imagePreview) return null;
-    return imagePreview;
-  }, [imagePreview]);
+  useEffect(() => {
+    adjustHeight();
+  }, [input]);
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages]);
 
   const handleUpload = (file: File | null) => {
     if (!file) return;
     const reader = new FileReader();
     reader.onload = () => {
-      setImagePreview(reader.result as string);
+      const result = reader.result as string;
+      setImagePreview(result);
+      toast.success('图片已附加，请输入你的问题或直接发送');
     };
     reader.readAsDataURL(file);
   };
 
-  const handleGenerateDraft = () => {
-    setDraft(createInitialDraft(questionText.trim(), enhancedImage));
-    toast.success('AI 草稿已生成，请确认后入库');
+  const buildContextPrompt = (ask: string, learningProfile: string, hasImage: boolean) => {
+    const imageHint = hasImage
+      ? '用户已上传题目图片（在前端会话中可见），请结合用户描述完成分析。'
+      : '用户暂未上传图片。';
+    return `${learningProfile}
+当前页面：AI 管家
+${imageHint}
+用户请求：${ask}`;
   };
 
-  const handleApplyCommand = (value: string) => {
-    if (!draft) return;
-    setDraft(applyCommand(draft, value));
-    setCommand('');
-    toast.success('草稿已根据指令更新');
+  const collectTagAdditions = (draft?: Partial<Question>) => {
+    const additions: { knowledge_point: string[]; ability: string[]; error_type: string[] } = {
+      knowledge_point: [],
+      ability: [],
+      error_type: [],
+    };
+    if (!draft) return additions;
+    if (draft.knowledge_point && !dictionary.knowledge_point.includes(String(draft.knowledge_point))) {
+      additions.knowledge_point.push(String(draft.knowledge_point));
+    }
+    if (draft.ability && !dictionary.ability.includes(String(draft.ability))) {
+      additions.ability.push(String(draft.ability));
+    }
+    if (draft.error_type && !dictionary.error_type.includes(String(draft.error_type))) {
+      additions.error_type.push(String(draft.error_type));
+    }
+    return additions;
   };
 
-  const handleSave = async () => {
-    if (!draft || !canSave) return;
-    setSaving(true);
-    try {
-      const note = [
-        `核心错因：${draft.core_reason}`,
-        ...draft.detailed_steps.map(item => `步骤${item.step} ${item.title}：${item.content}`),
-        draft.formula_or_rule ? `公式：${draft.formula_or_rule}` : '',
-        userNote ? `我的笔记：${userNote}` : '',
-      ].filter(Boolean).join('\n');
-      await questionsApi.create({
-        subject: draft.subject,
-        question_text: draft.question_text,
-        image_url: draft.original_image_url || undefined,
-        knowledge_point: draft.warning_tags[0] || '综合分析',
-        ability: '理解',
-        error_type: '概念不清',
-        note,
+  const executeAction = async (action: CopilotActionProposal, draft?: Partial<Question>, skipTagConfirm = false) => {
+    if (action.type === 'create_mistake') {
+      const additions = collectTagAdditions(draft);
+      const hasAdditions = additions.knowledge_point.length || additions.ability.length || additions.error_type.length;
+      if (hasAdditions && !skipTagConfirm) {
+        setPendingTagConfirm({ action, draft, additions });
+        return;
+      }
+      if (hasAdditions) {
+        approveNewTags(additions);
+        setDictionary(getCanonicalTagDictionary());
+      }
+      const normalized = normalizeMistakeDraft({
+        subject: '英语' as any,
+        question_text: draft?.question_text || '来自 AI 管家会话',
+        image_url: imagePreview || undefined,
+        knowledge_point: '时态',
+        ability: '规则应用',
+        error_type: '时态',
+        note: '由 AI 聊天生成',
+        ...(action.payload || {}),
+        ...draft,
       });
+      await questionsApi.create(normalized);
       toast.success('已存入错题库');
-      setDraft(null);
-      setQuestionText('');
-      setUserNote('');
-      setImagePreview(null);
-      setCommand('');
-    } catch (error: any) {
-      toast.error(error?.message || '保存失败');
-    } finally {
-      setSaving(false);
+      return;
+    }
+    if (action.type === 'start_review') {
+      navigate('/review', {
+        state: {
+          preset: action.payload?.preset || { subject: '英语', scope: 'due', amount: 10, sortBy: 'nearestDue' },
+          autoStart: true,
+        },
+      });
+      return;
+    }
+    if (action.type === 'start_drill') {
+      navigate('/practice', {
+        state: {
+          preset: action.payload?.preset || { subject: '英语', nodes: ['时态'], amount: 10, strategy: '递进' },
+          autoStart: true,
+        },
+      });
+      return;
+    }
+    if (action.type === 'update_tags') {
+      toast.info('AI 管家仅支持新建错题，请到错题详情页执行标签更新。');
+      return;
+    }
+    if (action.type === 'update_learning_content') {
+      toast.info('该动作适用于错题详情页知识抽屉，请在详细页执行。');
+      return;
+    }
+    if (action.type === 'delete_mistake') {
+      toast.info('AI 管家不支持删除错题。');
+    }
+  };
+
+  const handleSend = async (quickInput?: string) => {
+    const ask = (quickInput || input).trim() || (imagePreview ? '请根据我上传的题图帮我分析并给出下一步建议。' : '');
+    if (!ask || sending) return;
+    setSending(true);
+    
+    const currentImage = imagePreview;
+    setImagePreview(null);
+    
+    const baseMessages = [...messages, { role: 'user' as const, content: ask, image: currentImage || undefined }];
+    setMessages(baseMessages);
+    setInput('');
+    if (textareaRef.current) {
+      textareaRef.current.style.height = 'auto';
+    }
+
+    const placeholderIndex = baseMessages.length;
+    setMessages(prev => [...prev, { role: 'assistant', content: deepThinking ? '' : '正在思考...', reasoningContent: deepThinking ? '正在深度思考中...' : undefined }]);
+    if (deepThinking) {
+      setExpandedThinking(prev => ({ ...prev, [placeholderIndex]: true }));
+    }
+    const learningProfile = await buildCopilotLearningProfile();
+    
+    await new Promise<void>((resolve) => {
+      chatApi.streamCopilot(
+        [
+          ...baseMessages.map(item => ({ role: item.role, content: item.content })),
+          { role: 'user', content: buildContextPrompt(ask, learningProfile, Boolean(currentImage)) },
+        ],
+        (chunk, isReasoning) => {
+          setMessages(prev => {
+            const next = [...prev];
+            const current = next[placeholderIndex];
+            if (!current) return prev;
+            if (isReasoning) {
+              next[placeholderIndex] = { ...current, reasoningContent: (current.reasoningContent === '正在深度思考中...' ? '' : current.reasoningContent || '') + chunk };
+            } else {
+              next[placeholderIndex] = { ...current, content: (current.content === '正在思考...' ? '' : current.content) + chunk };
+            }
+            return next;
+          });
+        },
+        (full) => {
+          const action = parseCopilotAction(full);
+          const cleaned = stripActionBlock(full) || '我已经完成分析，请查看建议。';
+          const rawDraft = action?.type === 'create_mistake' || action?.type === 'update_tags'
+            ? normalizeMistakeDraft({
+              subject: '英语' as any,
+              question_text: '来自 AI 管家会话',
+              image_url: currentImage || undefined,
+              knowledge_point: '时态',
+              ability: '规则应用',
+              error_type: '时态',
+              note: '由 AI 聊天生成',
+              ...(action.payload || {}),
+            })
+            : undefined;
+          setMessages(prev => {
+            const next = [...prev];
+            const current = next[placeholderIndex];
+            next[placeholderIndex] = { ...current, role: 'assistant', content: cleaned, action: action || undefined, draft: rawDraft };
+            return next;
+          });
+          setExpandedThinking(prev => ({ ...prev, [placeholderIndex]: false }));
+          resolve();
+        },
+        (error) => {
+          setMessages(prev => {
+            const next = [...prev];
+            const current = next[placeholderIndex];
+            next[placeholderIndex] = { ...current, role: 'assistant', content: `请求失败：${error}`, isError: true, originalAsk: ask };
+            return next;
+          });
+          setExpandedThinking(prev => ({ ...prev, [placeholderIndex]: false }));
+          resolve();
+        },
+        { injectLearningProfile: true, enableThinking: deepThinking }
+      );
+    });
+    setSending(false);
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
     }
   };
 
   return (
-    <div className="mx-auto mt-6 w-full max-w-6xl space-y-6 px-4 py-6 sm:px-6 lg:px-8 md:mt-0">
-      <div className="rounded-3xl border border-gray-100 bg-white p-6 shadow-sm">
+    <div className="relative flex flex-1 flex-col bg-white">
+      <div className="flex shrink-0 items-center justify-between border-b border-gray-100 bg-white/95 px-5 py-4 backdrop-blur sticky top-0 z-10">
         <div className="flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-indigo-600 text-white">
-            <Wand2 className="h-5 w-5" />
+          <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-indigo-500 to-purple-600 text-white shadow-sm">
+            <Sparkles className="h-4 w-4" />
           </div>
           <div>
-            <h1 className="text-lg font-bold text-gray-900">AI 草稿确认页</h1>
-            <p className="text-sm text-gray-500">拍照或粘贴题目后，先确认草稿再入库</p>
+            <p className="text-[15px] font-bold text-gray-900">AI 错题管家</p>
+            <p className="text-[11px] font-medium text-gray-500">拍照或输入题目，我会帮你解析并入库</p>
           </div>
         </div>
-        <div className="mt-5 grid gap-4 md:grid-cols-2">
-          <textarea
-            value={questionText}
-            onChange={e => setQuestionText(e.target.value)}
-            rows={6}
-            className="w-full rounded-2xl border border-gray-200 px-4 py-3 text-sm text-gray-900 outline-none ring-indigo-400/30 transition focus:border-indigo-300 focus:ring-2"
-            placeholder="输入题目文本，或上传图片后点击生成草稿"
-          />
-          <div className="rounded-2xl border border-dashed border-gray-300 bg-gray-50 p-4">
-            <label className="flex cursor-pointer items-center justify-center gap-2 rounded-xl bg-white px-4 py-3 text-sm font-semibold text-gray-700 shadow-sm">
-              <ImagePlus className="h-4 w-4" />
-              上传题目图片
-              <input type="file" accept="image/*" className="hidden" onChange={e => handleUpload(e.target.files?.[0] || null)} />
-            </label>
-            {enhancedImage && (
-              <img
-                src={enhancedImage}
-                alt="enhanced-preview"
-                className="mt-4 max-h-48 w-full rounded-xl border border-gray-200 object-contain bg-white p-2"
-                style={{ filter: 'contrast(1.2) brightness(1.08)' }}
-              />
-            )}
-          </div>
-        </div>
-        <div className="mt-4 flex flex-wrap gap-3">
+        <div className="flex items-center gap-2">
           <button
-            onClick={handleGenerateDraft}
-            className="inline-flex items-center gap-2 rounded-xl bg-indigo-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-indigo-700"
+            onClick={() => setDeepThinking(!deepThinking)}
+            className={`flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium transition-colors ${
+              deepThinking
+                ? 'bg-indigo-50 text-indigo-600 border border-indigo-200'
+                : 'bg-gray-50 text-gray-500 border border-gray-200 hover:bg-gray-100'
+            }`}
           >
-            <Sparkles className="h-4 w-4" />
-            生成 AI 草稿
+            <BrainCircuit className="h-3.5 w-3.5" />
+            深度思考
           </button>
-          <span className="inline-flex items-center gap-1.5 text-xs text-gray-500">
-            <AlertCircle className="h-3.5 w-3.5" />
-            首期采用图像增强，不做生成式重绘
-          </span>
+          <button onClick={() => navigate(-1)} className="rounded-full p-2 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600">
+            <X className="h-5 w-5" />
+          </button>
         </div>
       </div>
 
-      {draft && (
-        <div className="rounded-3xl border border-gray-100 bg-white p-6 shadow-sm">
-          <div className="mb-4 flex items-center justify-between">
-            <h2 className="text-base font-bold text-gray-900">结构化草稿预览</h2>
-            <span className="rounded-full bg-indigo-50 px-3 py-1 text-xs font-semibold text-indigo-700">{draft.subject}</span>
-          </div>
-
-          {draft.original_image_url && (
-            <div className="mb-5 overflow-hidden rounded-2xl border border-gray-200 bg-gray-50 p-3">
-              <img src={draft.original_image_url} alt="original-question" className="max-h-80 w-full rounded-xl object-contain" />
+      {pendingTagConfirm && (
+        <div className="fixed inset-0 z-[140] flex items-center justify-center bg-black/35 p-4">
+          <div className="w-full max-w-lg rounded-2xl bg-white shadow-2xl">
+            <div className="border-b border-gray-100 px-5 py-4">
+              <h3 className="text-base font-bold text-gray-900">检测到新标签</h3>
+              <p className="mt-1 text-sm text-gray-500">AI 识别到当前词库中不存在的新标签，确认后将加入并与本题绑定。</p>
             </div>
-          )}
-
-          <div className="space-y-5">
-            <div className="rounded-2xl border border-rose-100 bg-rose-50 p-4">
-              <p className="text-xs font-semibold uppercase tracking-wide text-rose-500">核心错因</p>
-              <p className="mt-1 text-sm font-medium text-rose-700">{draft.core_reason}</p>
-            </div>
-
-            <div className="space-y-3">
-              {draft.detailed_steps.map(item => (
-                <article key={item.step} className="rounded-2xl border border-gray-100 bg-gray-50 p-4">
-                  <p className="text-sm font-semibold text-gray-900">步骤 {item.step} · {item.title}</p>
-                  <p className="mt-1.5 text-sm leading-relaxed text-gray-700">{item.content}</p>
-                </article>
-              ))}
-            </div>
-
-            {draft.formula_or_rule && (
-              <div className="rounded-2xl border border-indigo-100 bg-indigo-50 p-4">
-                <p className="text-xs font-semibold uppercase tracking-wide text-indigo-600">公式 / 口诀</p>
-                <div className="mt-2 overflow-x-auto rounded-xl bg-white p-3">
-                  <BlockMath math={stripMathWrapper(draft.formula_or_rule)} />
+            <div className="space-y-3 px-5 py-4">
+              {pendingTagConfirm.additions.knowledge_point.length > 0 && (
+                <div>
+                  <p className="text-xs font-semibold text-gray-500">知识点</p>
+                  <div className="mt-1 flex flex-wrap gap-2">
+                    {pendingTagConfirm.additions.knowledge_point.map(item => (
+                      <span key={item} className="rounded-full bg-indigo-50 px-2.5 py-1 text-xs font-medium text-indigo-700">{item}</span>
+                    ))}
+                  </div>
                 </div>
-              </div>
-            )}
-
-            {draft.prerequisite_knowledge && (
-              <div className="rounded-2xl border border-blue-100 bg-blue-50 p-4">
-                <p className="text-sm font-semibold text-blue-900">📚 {draft.prerequisite_knowledge.title}</p>
-                <div className="prose prose-sm mt-2 max-w-none text-blue-900">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{draft.prerequisite_knowledge.content}</ReactMarkdown>
+              )}
+              {pendingTagConfirm.additions.error_type.length > 0 && (
+                <div>
+                  <p className="text-xs font-semibold text-gray-500">错误标签</p>
+                  <div className="mt-1 flex flex-wrap gap-2">
+                    {pendingTagConfirm.additions.error_type.map(item => (
+                      <span key={item} className="rounded-full bg-amber-50 px-2.5 py-1 text-xs font-medium text-amber-700">{item}</span>
+                    ))}
+                  </div>
                 </div>
-              </div>
-            )}
-
-            {draft.warning_tags.length > 0 && (
-              <div className="flex flex-wrap gap-2">
-                {draft.warning_tags.map(tag => (
-                  <span key={tag} className="rounded-full bg-amber-100 px-3 py-1 text-xs font-semibold text-amber-700">#{tag}</span>
-                ))}
-              </div>
-            )}
-
-            <div className="rounded-2xl border border-gray-200 p-4">
-              <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">我的专属笔记（可选）</p>
-              <textarea
-                value={userNote}
-                onChange={e => setUserNote(e.target.value)}
-                rows={3}
-                className="mt-2 w-full rounded-xl border border-gray-200 px-3 py-2 text-sm outline-none ring-indigo-400/30 focus:border-indigo-300 focus:ring-2"
-                placeholder="补充你自己的记忆钩子或老师提醒"
-              />
+              )}
+              {pendingTagConfirm.additions.ability.length > 0 && (
+                <div>
+                  <p className="text-xs font-semibold text-gray-500">能力维度</p>
+                  <div className="mt-1 flex flex-wrap gap-2">
+                    {pendingTagConfirm.additions.ability.map(item => (
+                      <span key={item} className="rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-medium text-emerald-700">{item}</span>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+            <div className="flex items-center justify-end gap-2 border-t border-gray-100 px-5 py-4">
+              <button
+                type="button"
+                onClick={() => setPendingTagConfirm(null)}
+                className="rounded-lg border border-gray-200 px-4 py-2 text-sm font-medium text-gray-600 hover:bg-gray-50"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  const current = pendingTagConfirm;
+                  setPendingTagConfirm(null);
+                  if (!current) return;
+                  await executeAction(current.action, current.draft, true);
+                }}
+                className="rounded-lg bg-gray-900 px-4 py-2 text-sm font-semibold text-white hover:bg-gray-800"
+              >
+                确认添加并入库
+              </button>
             </div>
           </div>
-
-          <button
-            onClick={handleSave}
-            disabled={!canSave || saving}
-            className="mt-6 inline-flex w-full items-center justify-center gap-2 rounded-2xl bg-emerald-600 px-4 py-3 text-sm font-bold text-white transition hover:bg-emerald-700 disabled:bg-gray-300"
-          >
-            <Check className="h-4 w-4" />
-            {saving ? '保存中...' : '准确无误，存入错题库'}
-          </button>
         </div>
       )}
 
-      {draft && (
-        <div className="sticky bottom-4 z-20 rounded-2xl border border-indigo-100 bg-white/95 p-3 shadow-[0_12px_30px_-16px_rgba(79,70,229,0.45)] backdrop-blur">
-          <p className="mb-2 px-1 text-xs font-semibold text-indigo-600">有偏差？告诉 AI 老师怎么改...</p>
-          <div className="mb-2 flex flex-wrap gap-2">
-            {QUICK_COMMANDS.map(item => (
-              <button
-                key={item}
-                onClick={() => handleApplyCommand(item)}
-                className="rounded-full bg-indigo-50 px-3 py-1.5 text-xs font-semibold text-indigo-700 hover:bg-indigo-100"
-              >
-                {item}
+      {/* Scrollable Chat Area */}
+      <div className="flex-1 overflow-y-auto px-4 pb-48 pt-8 sm:px-6">
+        <div className="mx-auto max-w-3xl">
+          {messages.length === 0 ? (
+            // Empty State
+            <div className="flex flex-col items-center justify-center pt-16 md:pt-24 transition-all duration-500">
+              <div className="mb-6 flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-indigo-500 via-purple-500 to-pink-500 text-white shadow-lg shadow-purple-500/20">
+                <Sparkles className="h-8 w-8" />
+              </div>
+              <h1 className="mb-12 text-2xl font-semibold text-gray-900 md:text-3xl">今天想解决哪道错题？</h1>
+              
+              <div className="grid w-full grid-cols-1 gap-3 sm:grid-cols-2">
+                {SUGGESTIONS.map((item, idx) => (
+                  <button
+                    key={idx}
+                    onClick={() => handleSend(item.text)}
+                    className="flex flex-col items-start gap-3 rounded-xl bg-[#F3F4F6] p-4 text-left transition-all duration-200 hover:-translate-y-0.5 hover:bg-gray-200 hover:shadow-sm"
+                  >
+                    <div className="rounded-lg bg-white p-2 shadow-sm">{item.icon}</div>
+                    <span className="text-sm font-medium text-gray-700">{item.text}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : (
+            // Chat Stream
+            <div className="space-y-8">
+              {messages.map((msg, idx) => (
+                <div key={`${msg.role}-${idx}`} className={`flex w-full ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                  {msg.role === 'user' ? (
+                    <div className="max-w-[85%] rounded-2xl rounded-br-sm bg-gray-100 px-5 py-3.5 text-gray-900 transition-all duration-300 animate-in fade-in slide-in-from-bottom-2">
+                      <p className="whitespace-pre-wrap text-[15px] leading-relaxed">{msg.content}</p>
+                      {msg.image && (
+                        <img src={msg.image} alt="upload" className="mt-3 max-h-64 rounded-xl border border-gray-200 object-contain shadow-sm bg-white" />
+                      )}
+                    </div>
+                  ) : (
+                    <div className="flex w-full gap-4 transition-all duration-300 animate-in fade-in slide-in-from-bottom-2">
+                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-indigo-500 to-purple-600 text-white shadow-sm">
+                        <Sparkles className="h-4 w-4" />
+                      </div>
+                      <div className="flex-1 space-y-4 pt-1 min-w-0">
+                        {msg.reasoningContent && (
+                          <div className="mb-3 rounded-xl border border-gray-200 bg-gray-50/50 overflow-hidden">
+                            <button
+                              onClick={() => setExpandedThinking(prev => ({ ...prev, [idx]: !prev[idx] }))}
+                              className="flex w-full items-center justify-between px-4 py-2.5 text-sm font-medium text-gray-600 hover:bg-gray-100/50 transition-colors"
+                            >
+                              <div className="flex items-center gap-2">
+                                <BrainCircuit className="h-4 w-4 text-indigo-500" />
+                                {expandedThinking[idx] ? '深度思考过程' : '已完成深度思考'}
+                              </div>
+                              {expandedThinking[idx] ? (
+                                <ChevronDown className="h-4 w-4 text-gray-400" />
+                              ) : (
+                                <ChevronRight className="h-4 w-4 text-gray-400" />
+                              )}
+                            </button>
+                            {expandedThinking[idx] && (
+                              <div className="px-4 pb-3 pt-1 border-t border-gray-100">
+                                <div className="prose prose-sm prose-gray max-w-none text-gray-500 text-[13px] leading-relaxed opacity-80">
+                                  <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>
+                                    {msg.reasoningContent}
+                                  </ReactMarkdown>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                        <div className="prose prose-sm md:prose-base prose-gray max-w-none leading-relaxed text-gray-800 break-words">
+                          <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>
+                            {msg.content}
+                          </ReactMarkdown>
+                        </div>
+                        
+                        {msg.isError && (
+                          <div className="mt-2">
+                            <button
+                              onClick={() => {
+                                // Remove the error message and the previous user message
+                                setMessages(prev => prev.slice(0, -2));
+                                handleSend(msg.originalAsk);
+                              }}
+                              className="text-sm font-medium text-indigo-600 hover:text-indigo-700 hover:underline flex items-center gap-1"
+                            >
+                              <Sparkles className="w-3.5 h-3.5" />
+                              重新发送
+                            </button>
+                          </div>
+                        )}
+
+                        {msg.action && (
+                          <div className="mt-4 overflow-hidden rounded-2xl border border-gray-100 bg-white shadow-sm ring-1 ring-black/5 transition-all hover:shadow-md">
+                            <div className="border-b border-gray-50 bg-gray-50/50 px-4 py-3">
+                              <p className="text-sm font-semibold text-gray-900">{msg.action.title || '执行建议'}</p>
+                              <p className="mt-0.5 text-xs text-gray-500">{msg.action.description || '请确认后执行'}</p>
+                            </div>
+                            <div className="p-4">
+                              {msg.draft && (
+                                <div className="mb-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
+                                  <label className="flex flex-col gap-1.5">
+                                    <span className="text-xs font-medium text-gray-500">知识点</span>
+                                    <input
+                                      value={(draftEdits[idx]?.knowledge_point as string) ?? (msg.draft.knowledge_point || '')}
+                                      onChange={e => setDraftEdits(prev => ({ ...prev, [idx]: { ...prev[idx], knowledge_point: e.target.value } }))}
+                                      list={`kp-${idx}`}
+                                      className="rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-sm outline-none transition-all focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
+                                    />
+                                    <datalist id={`kp-${idx}`}>
+                                      {dictionary.knowledge_point.map(item => <option key={item} value={item} />)}
+                                    </datalist>
+                                  </label>
+                                  <label className="flex flex-col gap-1.5">
+                                    <span className="text-xs font-medium text-gray-500">能力维度</span>
+                                    <input
+                                      value={(draftEdits[idx]?.ability as string) ?? (msg.draft.ability || '')}
+                                      onChange={e => setDraftEdits(prev => ({ ...prev, [idx]: { ...prev[idx], ability: e.target.value } }))}
+                                      list={`ability-${idx}`}
+                                      className="rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-sm outline-none transition-all focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
+                                    />
+                                    <datalist id={`ability-${idx}`}>
+                                      {dictionary.ability.map(item => <option key={item} value={item} />)}
+                                    </datalist>
+                                  </label>
+                                  <label className="flex flex-col gap-1.5">
+                                    <span className="text-xs font-medium text-gray-500">错因</span>
+                                    <input
+                                      value={(draftEdits[idx]?.error_type as string) ?? (msg.draft.error_type || '')}
+                                      onChange={e => setDraftEdits(prev => ({ ...prev, [idx]: { ...prev[idx], error_type: e.target.value } }))}
+                                      list={`error-${idx}`}
+                                      className="rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-sm outline-none transition-all focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
+                                    />
+                                    <datalist id={`error-${idx}`}>
+                                      {dictionary.error_type.map(item => <option key={item} value={item} />)}
+                                    </datalist>
+                                  </label>
+                                </div>
+                              )}
+                              <div className="flex items-center gap-3">
+                                <button
+                                  onClick={async () => {
+                                    try {
+                                      await executeAction(msg.action!, draftEdits[idx] || msg.draft);
+                                      setMessages(prev => [...prev, { role: 'assistant', content: '操作已完成。还需要我继续安排下一步吗？' }]);
+                                    } catch (error: any) {
+                                      toast.error(error?.message || '执行失败');
+                                    }
+                                  }}
+                                  className="rounded-xl bg-gray-900 px-4 py-2 text-sm font-medium text-white transition-all hover:bg-gray-800 hover:shadow-md active:scale-95"
+                                >
+                                  确认执行
+                                </button>
+                                <span className="text-xs text-gray-400">
+                                  {msg.action.risk === 'high' ? '⚠️ 高风险动作将触发二次确认' : '建议先确认再执行'}
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ))}
+              <div ref={messagesEndRef} className="h-1" />
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Sticky Bottom Input Area */}
+      <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-white via-white/95 to-transparent pb-6 pt-12">
+        <div className="mx-auto max-w-3xl px-4 sm:px-6">
+          {imagePreview && (
+            <div className="mb-3 flex w-fit items-center gap-2 rounded-xl border border-gray-200 bg-white px-3 py-2 shadow-sm transition-all animate-in fade-in slide-in-from-bottom-2">
+              <ImagePlus className="h-4 w-4 text-indigo-500" />
+              <span className="text-xs font-medium text-gray-700">已附加题图</span>
+              <button onClick={() => setImagePreview(null)} className="ml-1 rounded-md p-1 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-700">
+                <X className="h-3.5 w-3.5" />
               </button>
-            ))}
-          </div>
-          <div className="flex items-end gap-2 rounded-xl border border-gray-200 px-3 py-2">
+            </div>
+          )}
+          
+          <div className="relative flex items-end gap-2 rounded-3xl border border-gray-200 bg-white p-2 shadow-sm transition-all duration-200 focus-within:border-indigo-400 focus-within:shadow-md focus-within:ring-4 focus-within:ring-indigo-50">
+            <label className="flex h-10 w-10 shrink-0 cursor-pointer items-center justify-center rounded-full text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-700">
+              <ImagePlus className="h-5 w-5" />
+              <input type="file" accept="image/*" className="hidden" onChange={e => handleUpload(e.target.files?.[0] || null)} />
+            </label>
+            
             <textarea
-              value={command}
-              onChange={e => setCommand(e.target.value)}
+              ref={textareaRef}
+              value={input}
+              onChange={e => setInput(e.target.value)}
+              onKeyDown={handleKeyDown}
               rows={1}
-              className="min-h-[24px] flex-1 resize-none bg-transparent text-sm text-gray-800 outline-none"
-              placeholder="输入修改指令"
+              className="max-h-32 min-h-[40px] flex-1 resize-none bg-transparent py-2 text-[15px] text-gray-900 outline-none placeholder:text-gray-400"
+              placeholder="输入你的问题，或上传图片..."
             />
+            
             <button
-              onClick={() => command.trim() && handleApplyCommand(command.trim())}
-              className="flex h-8 w-8 items-center justify-center rounded-lg bg-indigo-600 text-white hover:bg-indigo-700"
+              onClick={() => handleSend()}
+              disabled={sending || (!input.trim() && !imagePreview)}
+              className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-gray-900 text-white transition-all hover:bg-gray-800 disabled:bg-gray-100 disabled:text-gray-400 disabled:shadow-none shadow-sm"
             >
               <Send className="h-4 w-4" />
             </button>
           </div>
+          <p className="mt-3 text-center text-xs text-gray-400">AI 可能会犯错，请结合实际情况参考解析。</p>
         </div>
-      )}
+      </div>
     </div>
   );
 }

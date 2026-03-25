@@ -12,7 +12,7 @@ import { useTheme } from './theme-provider';
 const NAV_ITEMS = [
   { path: '/',          label: '首页',    icon: LayoutDashboard },
   { path: '/questions', label: '错题库',  icon: BookOpen },
-  { path: '/draft-review', label: '草稿确认', icon: Sparkles },
+  { path: '/draft-review', label: 'AI 管家', icon: Sparkles },
   { path: '/practice',  label: '专项练习', icon: Sparkles },
   { path: '/review',    label: '复习中心', icon: RotateCcw },
 ];

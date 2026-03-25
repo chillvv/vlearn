@@ -82,9 +82,13 @@ export function SettingsPage() {
   };
 
   const handleLogout = async () => {
-    await authApi.logout();
-    navigate('/login');
-    toast.success('已退出登录');
+    try {
+      await authApi.logout();
+      navigate('/login');
+      toast.success('已退出登录');
+    } catch (err: any) {
+      toast.error(err?.message || '退出登录失败');
+    }
   };
 
   const handleExport = async () => {
@@ -137,6 +141,7 @@ export function SettingsPage() {
 
   const handleImportByCode = async () => {
     if (!importCode.trim()) return toast.error('请输入分享码');
+    if (importCode.trim().length !== 8) return toast.error('分享码格式不正确（需要8位）');
     setImportLoading(true);
     try {
       const { questions } = await syncApi.importByCode(importCode.trim());
@@ -218,7 +223,7 @@ export function SettingsPage() {
             </div>
             <button
               onClick={handleChangePwd}
-              disabled={pwdLoading || !newPassword}
+              disabled={pwdLoading || !newPassword || newPassword.length < 6 || newPassword !== confirmPassword}
               className="h-10 px-5 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-200 disabled:text-gray-400 text-white rounded-xl text-sm font-semibold transition-colors flex items-center gap-2"
             >
               {pwdLoading ? <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" /> : <Shield className="w-4 h-4" />}
@@ -332,7 +337,7 @@ export function SettingsPage() {
                 />
                 <button
                   onClick={handleImportByCode}
-                  disabled={!importCode.trim() || importLoading}
+                  disabled={importCode.trim().length !== 8 || importLoading}
                   className="h-10 px-5 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-200 disabled:text-gray-400 text-white rounded-xl text-sm font-semibold transition-colors flex items-center gap-2"
                 >
                   {importLoading ? <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" /> : <Download className="w-4 h-4" />}

@@ -7,7 +7,7 @@ export function Navigation() {
   const navItems = [
     { path: '/', label: '首页', icon: Home },
     { path: '/questions', label: '错题库', icon: BookOpen },
-    { path: '/draft-review', label: '草稿确认', icon: Sparkles },
+    { path: '/draft-review', label: 'AI 管家', icon: Sparkles },
   ];
 
   return (

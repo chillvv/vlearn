@@ -1,0 +1,225 @@
+.obsidian-markdown {
+  --text-normal: #2e3338;
+  --text-muted: #5c6975;
+  --text-faint: #99aab5;
+  --text-title-h1: #2e3338;
+  --text-title-h2: #2e3338;
+  --text-title-h3: #2e3338;
+  --text-title-h4: #2e3338;
+  --text-title-h5: #2e3338;
+  --text-title-h6: #2e3338;
+  --text-link: #4d3ca6;
+  --text-link-hover: #7b61ff;
+  --text-highlight-bg: rgba(255, 208, 0, 0.4);
+  --text-selection: rgba(0, 122, 255, 0.2);
+  --bg-primary: #ffffff;
+  --bg-secondary: #f8f9fa;
+  --bg-accent: #f2f3f5;
+  --border-color: #e3e8ee;
+  --font-text-theme: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Microsoft YaHei Light", sans-serif;
+  --font-monospace-theme: ui-monospace, SFMono-Regular, "Cascadia Mono", "Roboto Mono", "Courier New", monospace;
+  --h1-size: 2em;
+  --h2-size: 1.5em;
+  --h3-size: 1.17em;
+  --h4-size: 1em;
+  --h5-size: 0.83em;
+  --h6-size: 0.67em;
+  --h1-weight: 700;
+  --h2-weight: 600;
+  --h3-weight: 600;
+  --h4-weight: 600;
+  --h5-weight: 600;
+  --h6-weight: 600;
+  --list-indent: 2em;
+  --blockquote-border-color: var(--text-link);
+  --blockquote-bg: rgba(77, 60, 166, 0.05);
+
+  font-family: var(--font-text-theme);
+  color: var(--text-normal);
+  line-height: 1.6;
+  font-size: 16px;
+  word-wrap: break-word;
+}
+
+.obsidian-markdown > *:first-child {
+  margin-top: 0;
+}
+
+.obsidian-markdown h1,
+.obsidian-markdown h2,
+.obsidian-markdown h3,
+.obsidian-markdown h4,
+.obsidian-markdown h5,
+.obsidian-markdown h6 {
+  margin-top: 1.5em;
+  margin-bottom: 0.5em;
+  line-height: 1.2;
+}
+
+.obsidian-markdown h1 {
+  font-size: var(--h1-size);
+  font-weight: var(--h1-weight);
+  color: var(--text-title-h1);
+}
+
+.obsidian-markdown h2 {
+  font-size: var(--h2-size);
+  font-weight: var(--h2-weight);
+  color: var(--text-title-h2);
+}
+
+.obsidian-markdown h3 {
+  font-size: var(--h3-size);
+  font-weight: var(--h3-weight);
+  color: var(--text-title-h3);
+}
+
+.obsidian-markdown h4 {
+  font-size: var(--h4-size);
+  font-weight: var(--h4-weight);
+  color: var(--text-title-h4);
+}
+
+.obsidian-markdown h5 {
+  font-size: var(--h5-size);
+  font-weight: var(--h5-weight);
+  color: var(--text-title-h5);
+}
+
+.obsidian-markdown h6 {
+  font-size: var(--h6-size);
+  font-weight: var(--h6-weight);
+  color: var(--text-title-h6);
+}
+
+.obsidian-markdown p {
+  margin-top: 0;
+  margin-bottom: 1rem;
+}
+
+.obsidian-markdown ul {
+  margin-top: 0;
+  margin-bottom: 1rem;
+  padding-left: var(--list-indent);
+  list-style-type: disc;
+}
+
+.obsidian-markdown ul ul {
+  list-style-type: circle;
+  margin-bottom: 0;
+}
+
+.obsidian-markdown ul ul ul {
+  list-style-type: square;
+}
+
+.obsidian-markdown ol {
+  margin-top: 0;
+  margin-bottom: 1rem;
+  padding-left: var(--list-indent);
+  list-style-type: decimal;
+}
+
+.obsidian-markdown ol ol {
+  list-style-type: lower-alpha;
+  margin-bottom: 0;
+}
+
+.obsidian-markdown li {
+  margin-bottom: 0.25em;
+}
+
+.obsidian-markdown li > p {
+  margin-bottom: 0;
+}
+
+.obsidian-markdown a {
+  color: var(--text-link);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.obsidian-markdown a:hover {
+  color: var(--text-link-hover);
+  text-decoration: underline;
+}
+
+.obsidian-markdown blockquote {
+  border-left: 4px solid var(--blockquote-border-color);
+  padding: 0.5em 1em;
+  color: var(--text-muted);
+  margin: 1em 0;
+  background-color: var(--blockquote-bg);
+  border-radius: 0 4px 4px 0;
+}
+
+.obsidian-markdown blockquote p:last-child {
+  margin-bottom: 0;
+}
+
+.obsidian-markdown code {
+  font-family: var(--font-monospace-theme);
+  background-color: var(--bg-accent);
+  padding: 0.2em 0.4em;
+  border-radius: 4px;
+  font-size: 0.85em;
+  color: #c7254e;
+}
+
+.obsidian-markdown pre {
+  background-color: var(--bg-secondary);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  margin: 1em 0;
+  border: 1px solid var(--border-color);
+}
+
+.obsidian-markdown pre code {
+  background-color: transparent;
+  padding: 0;
+  color: var(--text-normal);
+  font-size: 0.85em;
+  border-radius: 0;
+}
+
+.obsidian-markdown table {
+  border-collapse: collapse;
+  width: 100%;
+  margin-bottom: 1rem;
+}
+
+.obsidian-markdown th,
+.obsidian-markdown td {
+  border: 1px solid var(--border-color);
+  padding: 0.5em 1em;
+  text-align: left;
+}
+
+.obsidian-markdown th {
+  background-color: var(--bg-secondary);
+  font-weight: 600;
+}
+
+.obsidian-markdown hr {
+  height: 2px;
+  background-color: var(--border-color);
+  border: none;
+  margin: 2em 0;
+}
+
+.obsidian-markdown img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 4px;
+}
+
+/* Katex Math Styling adjustments if needed */
+.obsidian-markdown .math {
+  font-size: 1.1em;
+}
+
+/* Add custom checkbox styling for lists if needed */
+.obsidian-markdown input[type="checkbox"] {
+  margin-right: 0.5em;
+}

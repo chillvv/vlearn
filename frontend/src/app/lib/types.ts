@@ -1,3 +1,5 @@
+import type { QuestionNormalizedPayload, QuestionType, RenderMode, ValidationStatus } from './questionPayload';
+
 export interface KnowledgePoint {
   id: string;
   subject: string;
@@ -16,6 +18,8 @@ export interface Question {
   knowledge_point: string;
   ability: string;
   error_type: string;
+  question_type?: QuestionType;
+  correct_answer?: string;
   note?: string;
   summary?: string;
   mastery_level?: number;
@@ -24,6 +28,11 @@ export interface Question {
   stubborn_flag?: boolean;
   created_at: string;
   review_count: number;
+  raw_ai_response?: string;
+  normalized_payload?: QuestionNormalizedPayload | null;
+  payload_version?: string;
+  validation_status?: ValidationStatus;
+  render_mode?: RenderMode;
 }
 
 export interface UserWeakness {
@@ -35,25 +44,101 @@ export interface UserWeakness {
   last_updated: string;
 }
 
+export type Subject = '英语' | 'C语言';
+
 export const ENGLISH_KNOWLEDGE_POINTS = [
-  "时态", "主谓一致", "从句", "被动语态", "非谓语动词", "介词", "冠词", "代词", "词义辨析", "词形变化", "固定搭配", "主旨理解", "细节理解", "推理判断", "句子结构", "逻辑连接", "表达准确"
+  '时态',
+  '主谓一致',
+  '虚拟语气',
+  '从句',
+  '被动语态',
+  '非谓语动词',
+  '介词',
+  '冠词',
+  '代词',
+  '词形变化',
+  '词义辨析',
+  '固定搭配',
+  '主旨理解',
+  '细节理解',
+  '推理判断',
+  '句子结构',
+  '逻辑连接',
+  '表达准确',
 ];
 
 export const PROGRAMMING_KNOWLEDGE_POINTS = [
-  "变量与数据类型", "运算符与表达式", "选择结构", "循环结构", "函数", "数组与字符串", "指针", "结构体", "文件操作", "排序与查找", "代码阅读", "边界条件"
+  '变量与数据类型',
+  '运算符与表达式',
+  '选择结构',
+  '循环结构',
+  '函数',
+  '数组',
+  '字符串',
+  '指针',
+  '结构体',
+  '文件操作',
+  '排序与查找',
+  '内存管理',
+  '边界条件',
 ];
 
-export const ABILITIES = ["识别", "理解", "应用", "表达"];
+export const ABILITIES = ['知识点定位', '规则应用', '步骤执行', '表达输出'];
 
-export const ERROR_TYPES = ["概念不清", "混淆", "粗心", "不熟练", "审题错误"];
+export const SUBJECT_ERROR_TYPES: Record<Subject, string[]> = {
+  英语: [
+    '时态',
+    '主谓一致',
+    '虚拟语气',
+    '从句',
+    '非谓语动词',
+    '词义辨析',
+    '固定搭配',
+    '阅读主旨',
+    '阅读细节',
+    '阅读推理',
+    '写作表达',
+  ],
+  C语言: [
+    '数据类型',
+    '运算表达式',
+    '分支循环',
+    '函数调用',
+    '数组',
+    '字符串',
+    '指针',
+    '结构体',
+    '文件操作',
+    '内存管理',
+    '边界条件',
+    '排序查找',
+  ],
+};
+
+export const ERROR_TYPES = Array.from(new Set([...SUBJECT_ERROR_TYPES.英语, ...SUBJECT_ERROR_TYPES.C语言]));
+
+export function getKnowledgePointsBySubject(subject?: string) {
+  if (subject === 'C语言') return PROGRAMMING_KNOWLEDGE_POINTS;
+  return ENGLISH_KNOWLEDGE_POINTS;
+}
+
+export function getErrorTypesBySubject(subject?: string) {
+  if (subject === 'C语言') return SUBJECT_ERROR_TYPES.C语言;
+  return SUBJECT_ERROR_TYPES.英语;
+}
 
 export interface Stats {
   total: number;
   weaknessCount: number;
+  dueReviewCount: number;
   topWeakness: UserWeakness | null;
   subjectCounts: Record<string, number>;
   newThisWeek: number;
   recent: Question[];
+  subjectMastery: { subject: string; score: number; count: number }[];
+  weeklyActivity: number[];
+  errorTypes: { name: string; value: number }[];
+  weaknessesList: UserWeakness[];
 }
 
 export interface QuestionCardData {
@@ -77,13 +162,13 @@ export interface ChatMessage {
   saved?: boolean;
 }
 
-export type Subject = '英语' | 'C语言';
-
 export interface VariantQuestion {
   level: number;
+  question_type: QuestionType;
   question_text: string;
   options: string[];
   correct_answer: string;
+  acceptable_answers?: string[];
   explanation: string;
 }
 

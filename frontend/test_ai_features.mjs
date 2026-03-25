@@ -20,6 +20,22 @@ function parseSSEPayload(rawText) {
   return content;
 }
 
+function parseActionBlock(rawText) {
+  const match = rawText.match(/<ACTION>([\s\S]*?)<\/ACTION>/i);
+  if (!match) return null;
+  try {
+    return JSON.parse(match[1].trim());
+  } catch {
+    return null;
+  }
+}
+
+function isOutOfScopeLearningRequest(input) {
+  const normalized = String(input || "").trim().toLowerCase();
+  const denyKeywords = ["笑话", "天气", "电影", "八卦", "聊天", "闲聊", "段子"];
+  return denyKeywords.some((keyword) => normalized.includes(keyword));
+}
+
 async function runMockStreamingTest() {
   const mockRaw = [
     'data: {"choices":[{"delta":{"reasoning_content":"思考"}}]}',
@@ -30,6 +46,16 @@ async function runMockStreamingTest() {
   ].join("\n");
   const content = parseSSEPayload(mockRaw);
   assert.equal(content, "你好");
+}
+
+async function runCopilotContractTest() {
+  const sample = `这是你的复习计划。\n<ACTION>\n{"type":"start_review","risk":"low","payload":{"preset":{"scope":"due"}}}\n</ACTION>`;
+  const parsed = parseActionBlock(sample);
+  assert.equal(parsed.type, "start_review");
+  assert.equal(parsed.risk, "low");
+  assert.equal(parsed.payload.preset.scope, "due");
+  assert.equal(isOutOfScopeLearningRequest("给我讲个笑话"), true);
+  assert.equal(isOutOfScopeLearningRequest("帮我复习定语从句"), false);
 }
 
 async function runLiveChatTest() {
@@ -89,6 +115,7 @@ async function runLiveQuestionGenerationTest() {
 }
 
 await runMockStreamingTest();
+await runCopilotContractTest();
 if (!apiKey) {
   console.log("mock test passed; live tests skipped because DASHSCOPE_API_KEY is missing");
   process.exit(0);

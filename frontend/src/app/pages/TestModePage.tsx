@@ -1,6 +1,5 @@
 import { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router';
-import { Sparkles, Play, Check, X, ChevronRight, RotateCcw, Loader2 } from 'lucide-react';
+import { Sparkles, Play, Check, ChevronRight, RotateCcw } from 'lucide-react';
 import { chatApi, weaknessApi, questionsApi } from '../lib/api';
 import { toast } from 'sonner';
 import type { UserWeakness } from '../lib/types';
@@ -41,10 +40,27 @@ function normalizeChoiceOptions(raw: any): string[] {
 
 function normalizeCorrectAnswer(answer: string, options: string[]) {
   const raw = String(answer || '').trim();
-  const letterMatch = raw.match(/[A-H]/i);
-  if (letterMatch) return letterMatch[0].toUpperCase();
-  const optionIdx = options.findIndex((item) => item.includes(raw));
-  if (optionIdx >= 0) return String.fromCharCode(65 + optionIdx);
+  
+  // Try matching exactly with an option text (ignoring the "A. " part)
+  const optionIdxByText = options.findIndex((item) => {
+    const textPart = item.replace(/^[A-H][\.．、:：\)）\]]\s*/i, '').trim().toLowerCase();
+    return textPart === raw.toLowerCase();
+  });
+  if (optionIdxByText >= 0) return String.fromCharCode(65 + optionIdxByText);
+
+  // Exact letter match
+  const exactLetterMatch = raw.match(/^([A-H])(\.|、|:)?$/i);
+  if (exactLetterMatch) return exactLetterMatch[1].toUpperCase();
+
+  // Prefix match (like "A. is")
+  const prefixMatch = raw.match(/^([A-H])[\.\s、:]/i);
+  if (prefixMatch) return prefixMatch[1].toUpperCase();
+
+  // Single letter match
+  if (raw.length === 1 && raw.match(/[A-H]/i)) {
+    return raw.toUpperCase();
+  }
+
   return raw;
 }
 
@@ -54,8 +70,6 @@ export function TestModePage() {
   const [selectedWeaknessId, setSelectedWeaknessId] = useState<string>('');
   const [questions, setQuestions] = useState<TestQuestion[]>([]);
   const [currentIdx, setCurrentIdx] = useState(0);
-  const [loading, setLoading] = useState(false);
-  const navigate = useNavigate();
 
   useEffect(() => {
     weaknessApi.getAll().then(ws => {
@@ -69,7 +83,6 @@ export function TestModePage() {
     if (!targetW) return toast.error('请选择要训练的弱点');
 
     setStep('generating');
-    setLoading(true);
 
     const prompt = `请针对学习弱点生成3道训练题。
     学科相关，知识点是【${targetW.knowledge_point}】，能力维度是【${targetW.ability}】。
@@ -125,8 +138,6 @@ export function TestModePage() {
     } catch (err: any) {
       toast.error('生成题目失败: ' + err.message);
       setStep('setup');
-    } finally {
-      setLoading(false);
     }
   };
 
@@ -158,9 +169,18 @@ export function TestModePage() {
       await questionsApi.create({
         subject: targetW ? (targetW.knowledge_point.match(/时态|主谓|从句|语态|介词|冠词|代词|阅读|写作|翻译|词/) ? '英语' : 'C语言') : 'C语言',
         question_text: formattedQuestionText,
+        question_type: q.questionType,
+        correct_answer: q.correctAnswer,
+        raw_ai_response: JSON.stringify({
+          question: q.question,
+          questionType: q.questionType,
+          options: q.options,
+          correctAnswer: q.correctAnswer,
+          analysis: q.analysis,
+        }),
         knowledge_point: q.knowledge,
         ability: q.ability,
-        error_type: '不熟练', // 默认
+        error_type: q.knowledge,
         note: q.analysis,
       });
       toast.success('已回流到错题库，弱点权重增加！');

@@ -4,6 +4,7 @@ import { Dashboard } from './pages/Dashboard';
 import { DraftReviewPage } from './pages/DraftReviewPage';
 import { MistakeBookPage } from './pages/MistakeBookPage';
 import { MistakeNodeHubPage } from './pages/MistakeNodeHubPage';
+import { KnowledgeDetailPage } from './pages/KnowledgeDetailPage';
 import { ReviewModePage } from './pages/ReviewModePage';
 import { TargetedDrillPage } from './pages/TargetedDrillPage';
 import { SettingsPage } from './pages/SettingsPage';
@@ -42,6 +43,7 @@ export const router = createBrowserRouter([
       { path: 'test', Component: TestModePage },
       { path: 'questions', Component: MistakeBookPage },
       { path: 'questions/node', Component: MistakeNodeHubPage },
+      { path: 'questions/node/knowledge', Component: KnowledgeDetailPage },
       { path: 'practice', Component: TargetedDrillPage },
       { path: 'review', Component: ReviewModePage },
       { path: 'settings', Component: SettingsPage },

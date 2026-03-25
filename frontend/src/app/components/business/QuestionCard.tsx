@@ -46,10 +46,20 @@ export function QuestionCard({ question, onDelete, onEdit, readonly = false }: Q
             </div>
 
             {expanded ? (
-              <p className="text-sm text-card-foreground leading-relaxed">{question.question_text}</p>
+              <MistakeQuestionPreview
+                questionText={question.question_text}
+                normalizedPayload={question.normalized_payload}
+                validationStatus={question.validation_status}
+                stemClassName="text-sm text-card-foreground leading-relaxed"
+                optionClassName="inline-flex min-w-0 items-center gap-1.5 rounded-xl border border-slate-200/90 bg-gradient-to-r from-slate-50 to-white px-2.5 py-1 text-[11px] text-slate-600"
+                maxOptions={8}
+                showKindBadge
+              />
             ) : (
               <MistakeQuestionPreview
                 questionText={question.question_text}
+                normalizedPayload={question.normalized_payload}
+                validationStatus={question.validation_status}
                 stemClassName="line-clamp-2 text-sm text-card-foreground leading-relaxed"
                 optionClassName="inline-flex max-w-[180px] items-center gap-1 rounded-lg border border-border bg-muted px-2 py-0.5 text-[11px] text-muted-foreground"
                 showKindBadge
@@ -128,14 +138,7 @@ export function QuestionCard({ question, onDelete, onEdit, readonly = false }: Q
                   >
                     <Edit2 className="w-3.5 h-3.5" />
                   </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    onClick={(e) => { e.stopPropagation(); onDelete?.(question.id); }}
-                    className="w-8 h-8 rounded-xl text-muted-foreground hover:text-destructive hover:bg-destructive/10"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </Button>
+                  <DeleteConfirmButton onDelete={() => onDelete?.(question.id)} />
                 </div>
               )}
             </div>
@@ -143,5 +146,29 @@ export function QuestionCard({ question, onDelete, onEdit, readonly = false }: Q
         </div>
       )}
     </div>
+  );
+}
+
+function DeleteConfirmButton({ onDelete }: { onDelete: () => void }) {
+  const [confirming, setConfirming] = useState(false);
+  return confirming ? (
+    <Button
+      variant="destructive"
+      size="sm"
+      onClick={(e) => { e.stopPropagation(); onDelete(); }}
+      onMouseLeave={() => setConfirming(false)}
+      className="h-8 rounded-xl text-xs px-3 font-bold"
+    >
+      确定删除?
+    </Button>
+  ) : (
+    <Button
+      variant="ghost"
+      size="icon"
+      onClick={(e) => { e.stopPropagation(); setConfirming(true); }}
+      className="w-8 h-8 rounded-xl text-muted-foreground hover:text-destructive hover:bg-destructive/10"
+    >
+      <Trash2 className="w-3.5 h-3.5" />
+    </Button>
   );
 }

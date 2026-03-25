@@ -2,8 +2,12 @@ import { useEffect, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router';
 import { questionsApi } from '../lib/api';
 import type { Question, Subject } from '../lib/types';
-import { Zap, Settings, Flame, Trophy, Calendar, CheckCircle2, AlertCircle, RefreshCw, BarChart3, BookOpen, Calculator, Play } from 'lucide-react';
+import { Zap, Settings, Trophy, CheckCircle2, AlertCircle, RefreshCw, BarChart3, BookOpen, Calculator, Play } from 'lucide-react';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from 'recharts';
+import { MistakeQuestionPreview } from '../components/business/MistakeQuestionPreview';
+import { parseQuestionPreview } from '../lib/questionPreview';
+import { normalizeCorrectAnswer } from '../lib/questionPayload';
+import { toast } from 'sonner';
 
 type ReviewStatus = 'configuring' | 'ready' | 'loading' | 'active' | 'completed';
 
@@ -16,6 +20,7 @@ type ReviewConfig = {
 
 type ReviewPresetState = {
   preset?: Partial<ReviewConfig>;
+  autoStart?: boolean;
 };
 
 const defaultConfig: ReviewConfig = {
@@ -51,9 +56,12 @@ export function ReviewModePage() {
   const [cards, setCards] = useState<Question[]>([]);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [flipped, setFlipped] = useState(false);
+  const [userAnswer, setUserAnswer] = useState('');
+  const [actionLoading, setActionLoading] = useState(false);
   
   const [dueCount, setDueCount] = useState(0);
   const [chartData] = useState(generateChartData());
+  const [autoStarted, setAutoStarted] = useState(false);
 
   useEffect(() => {
     // Fetch initial stats
@@ -68,42 +76,96 @@ export function ReviewModePage() {
     fetchStats();
   }, []);
 
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    const onlyUnmastered = params.get('onlyUnmastered');
+    const onlyDue = params.get('onlyDue');
+    const onlyStubborn = params.get('onlyStubborn');
+    const subject = params.get('subject');
+    setConfig((prev) => {
+      let scope = prev.scope;
+      if (onlyUnmastered === 'true') scope = 'unmastered';
+      if (onlyStubborn === 'true') scope = 'stubborn';
+      if (onlyDue === 'true') scope = 'due';
+      if (onlyUnmastered !== 'true' && onlyStubborn !== 'true' && onlyDue !== 'true' && params.get('scope')) {
+        const nextScope = params.get('scope') as ReviewConfig['scope'];
+        if (nextScope) scope = nextScope;
+      }
+      return {
+        ...prev,
+        subject: subject === 'C语言' || subject === '英语' ? (subject as Subject) : prev.subject,
+        scope,
+      };
+    });
+  }, [location.search]);
+
   const current = cards[currentIndex];
+  const fallbackPreview = current ? parseQuestionPreview(current.question_text) : null;
+  const payload = current?.normalized_payload;
+  const previewOptions = payload?.options?.length ? payload.options : (fallbackPreview?.options || []);
+  const isChoice = Boolean(current && previewOptions.length > 0 && (payload?.questionType || fallbackPreview?.kind) === 'choice');
+  const rawCorrectAnswer = current?.correct_answer || payload?.answerSchema?.correctAnswer || '';
+  const correctAnswer = isChoice ? normalizeCorrectAnswer(rawCorrectAnswer, previewOptions) : rawCorrectAnswer;
+  const canReveal = isChoice ? Boolean(userAnswer) : userAnswer.trim().length > 0;
 
   const startReview = async () => {
     setStatus('loading');
-    const next = await questionsApi.getAll({
-      subject: config.subject,
-      onlyDue: config.scope === 'due',
-      onlyUnmastered: config.scope === 'unmastered',
-      onlyStubborn: config.scope === 'stubborn',
-      sortBy: config.sortBy,
-      limit: config.amount === 999 ? undefined : config.amount,
-    });
-    setCards(next.length > 0 ? next : []);
-    setCurrentIndex(0);
-    setFlipped(false);
-    setStatus('active');
+    try {
+      const next = await questionsApi.getAll({
+        subject: config.subject,
+        onlyDue: config.scope === 'due',
+        onlyUnmastered: config.scope === 'unmastered',
+        onlyStubborn: config.scope === 'stubborn',
+        sortBy: config.sortBy,
+        limit: config.amount === 999 ? undefined : config.amount,
+      });
+      setCards(next.length > 0 ? next : []);
+      setCurrentIndex(0);
+      setFlipped(false);
+      setUserAnswer('');
+      setStatus('active');
+    } catch (error: any) {
+      toast.error(error?.message || '开始复习失败');
+      setStatus('ready');
+    }
   };
+
+  useEffect(() => {
+    if (!state.autoStart || autoStarted || status !== 'ready') return;
+    setAutoStarted(true);
+    void startReview();
+  }, [state.autoStart, autoStarted, status]);
 
   const handleAction = async (action: 'forgot' | 'vague' | 'mastered') => {
     if (!current) return;
-    if (action === 'forgot') {
-      await questionsApi.swipeReview(current.id, 'again');
-    } else if (action === 'mastered') {
-      await questionsApi.swipeReview(current.id, 'easy');
-    } else {
-      await questionsApi.update(current.id, {
-        confidence: Math.min(1, (current.confidence || 0.5) + 0.03),
-        review_count: (current.review_count || 0) + 1,
-      });
+    if (actionLoading) return;
+    if (!flipped) return toast.error('请先作答并查看解析');
+    if (!canReveal) return toast.error('请先作答');
+    setActionLoading(true);
+    try {
+      if (action === 'forgot') {
+        await questionsApi.swipeReview(current.id, 'again');
+      } else if (action === 'mastered') {
+        await questionsApi.swipeReview(current.id, 'easy');
+      } else {
+        await questionsApi.update(current.id, {
+          confidence: Math.min(1, (current.confidence || 0.5) + 0.03),
+          review_count: (current.review_count || 0) + 1,
+        });
+      }
+    } catch (error: any) {
+      toast.error(error?.message || '提交失败，请重试');
+      setActionLoading(false);
+      return;
     }
+    setActionLoading(false);
     if (currentIndex >= cards.length - 1) {
       setStatus('completed');
       return;
     }
     setCurrentIndex(prev => prev + 1);
     setFlipped(false);
+    setUserAnswer('');
   };
 
   if (status === 'loading') {
@@ -135,31 +197,107 @@ export function ReviewModePage() {
         </div>
         
         <section className="rounded-2xl border border-border bg-card p-6 md:p-10 min-h-[400px] flex flex-col shadow-sm">
-          <div className="flex-1">
-            {!flipped ? (
-              <div className="space-y-6">
-                <div className="flex gap-2">
-                  <span className="inline-flex items-center rounded-md bg-accent px-2.5 py-1 text-xs font-semibold text-accent-foreground">{current.subject}</span>
-                  <span className="inline-flex items-center rounded-md bg-secondary/20 px-2.5 py-1 text-xs font-medium text-foreground">{current.category || current.knowledge_point}</span>
-                </div>
-                <p className="text-xl font-medium text-foreground leading-relaxed mt-4">{current.question_text}</p>
+          <div className="flex-1 space-y-8">
+            {/* Question Section - Always visible */}
+            <div className="space-y-6">
+              <div className="flex gap-2">
+                <span className="inline-flex items-center rounded-md bg-accent px-2.5 py-1 text-xs font-semibold text-accent-foreground">{current.subject}</span>
+                <span className="inline-flex items-center rounded-md bg-secondary/20 px-2.5 py-1 text-xs font-medium text-foreground">{current.category || current.knowledge_point}</span>
               </div>
-            ) : (
-              <div className="space-y-6">
-                <div className="border-b border-border pb-4">
-                  <p className="text-sm text-primary font-bold tracking-wide uppercase flex items-center gap-1 mb-2">
+              <div className="mt-4">
+                <MistakeQuestionPreview
+                  questionText={current.question_text}
+                  normalizedPayload={current.normalized_payload}
+                  validationStatus={current.validation_status}
+                  stemClassName="text-xl font-medium text-foreground leading-relaxed"
+                  optionClassName="inline-flex min-w-0 items-center gap-1.5 rounded-xl border border-border bg-muted/40 px-3 py-1.5 text-xs text-foreground"
+                  maxOptions={8}
+                  showKindBadge
+                  hideOptions={isChoice} // Hide original preview options because we render clickable ones below
+                />
+              </div>
+              
+              {/* User Answer Section */}
+              {isChoice ? (
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  {previewOptions.slice(0, 8).map((opt) => {
+                    const active = userAnswer === opt.label;
+                    const isCorrect = correctAnswer === opt.label;
+                    const showCorrectness = flipped;
+                    
+                    let btnClass = `rounded-2xl border-2 px-4 py-3 text-left transition-all ${active ? 'border-primary bg-primary/5 text-primary shadow-sm' : 'border-border bg-background hover:bg-accent/50 text-foreground'}`;
+                    
+                    if (showCorrectness) {
+                      if (isCorrect) {
+                        btnClass = 'rounded-2xl border-2 border-emerald-500 bg-emerald-50 text-emerald-700 px-4 py-3 text-left shadow-sm';
+                      } else if (active && !isCorrect) {
+                        btnClass = 'rounded-2xl border-2 border-rose-500 bg-rose-50 text-rose-700 px-4 py-3 text-left shadow-sm';
+                      } else {
+                        btnClass = 'rounded-2xl border-2 border-border bg-background/50 text-muted-foreground px-4 py-3 text-left opacity-60';
+                      }
+                    }
+
+                    return (
+                      <button
+                        key={`${opt.label}-${opt.text}`}
+                        type="button"
+                        disabled={flipped}
+                        onClick={() => !flipped && setUserAnswer(opt.label)}
+                        className={btnClass}
+                      >
+                        <div className="flex items-center justify-between">
+                          <div>
+                            <span className="font-bold mr-2">{opt.label}.</span>
+                            <span className="break-words">{opt.text}</span>
+                          </div>
+                          {showCorrectness && isCorrect && <span className="text-emerald-500 text-lg">✅</span>}
+                          {showCorrectness && active && !isCorrect && <span className="text-rose-500 text-lg">❌</span>}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <label className="text-sm font-semibold text-foreground">你的答案</label>
+                  <textarea
+                    value={userAnswer}
+                    disabled={flipped}
+                    onChange={(e) => setUserAnswer(e.target.value)}
+                    placeholder="请输入你的答案（至少1个字符）"
+                    className="min-h-[120px] w-full rounded-2xl border border-border bg-background p-4 text-sm leading-relaxed outline-none focus:ring-2 ring-primary/20 disabled:opacity-70 disabled:bg-muted/50"
+                  />
+                  {flipped && (
+                    <div className="mt-4 p-4 rounded-xl bg-emerald-50 border border-emerald-200">
+                      <p className="text-sm text-emerald-800 font-bold mb-1">标准答案</p>
+                      <p className="text-emerald-700">{correctAnswer || '无'}</p>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Explanation Section - Only visible when flipped */}
+            {flipped && (
+              <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
+                <div className="border-t border-border pt-6">
+                  <p className="text-sm text-primary font-bold tracking-wide uppercase flex items-center gap-1 mb-3">
                     <CheckCircle2 className="h-4 w-4" />
                     AI 解析
                   </p>
-                  <p className="text-lg font-medium text-foreground leading-relaxed">{current.note || '请按知识点复盘'}</p>
+                  <div className="rounded-xl bg-primary/5 p-5 text-foreground leading-relaxed">
+                    {current.note || '请按知识点复盘'}
+                  </div>
                 </div>
-                <div>
-                  <p className="text-sm text-destructive font-bold tracking-wide uppercase flex items-center gap-1 mb-2">
-                    <AlertCircle className="h-4 w-4" />
-                    上次误区
-                  </p>
-                  <p className="text-base text-muted-foreground">{current.summary || '暂无记录'}</p>
-                </div>
+                {current.summary && (
+                  <div>
+                    <p className="text-sm text-destructive font-bold tracking-wide uppercase flex items-center gap-1 mb-2">
+                      <AlertCircle className="h-4 w-4" />
+                      上次误区
+                    </p>
+                    <p className="text-base text-muted-foreground bg-destructive/5 rounded-xl p-4">{current.summary}</p>
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -168,8 +306,15 @@ export function ReviewModePage() {
             {!flipped ? (
               <button 
                 type="button" 
-                onClick={() => setFlipped(true)} 
-                className="w-full rounded-xl bg-primary px-4 py-4 text-lg font-bold text-primary-foreground hover:bg-primary/90 transition-all shadow-sm"
+                onClick={() => {
+                  if (!canReveal) {
+                    toast.error(isChoice ? '请先选择答案' : '请先输入答案');
+                    return;
+                  }
+                  setFlipped(true);
+                }}
+                disabled={!canReveal}
+                className="w-full rounded-xl bg-primary px-4 py-4 text-lg font-bold text-primary-foreground hover:bg-primary/90 transition-all shadow-sm disabled:opacity-40"
               >
                 查看解析
               </button>
@@ -180,7 +325,8 @@ export function ReviewModePage() {
                   <button 
                     type="button" 
                     onClick={() => handleAction('forgot')} 
-                    className="flex flex-col items-center justify-center gap-1 rounded-xl border border-destructive/30 bg-destructive/5 py-4 text-destructive hover:bg-destructive/10 transition-colors"
+                    disabled={actionLoading}
+                    className="flex flex-col items-center justify-center gap-1 rounded-xl border border-destructive/30 bg-destructive/5 py-4 text-destructive hover:bg-destructive/10 transition-colors disabled:opacity-60"
                   >
                     <span className="text-lg font-bold">忘记了</span>
                     <span className="text-xs opacity-80">1天后复习</span>
@@ -188,7 +334,8 @@ export function ReviewModePage() {
                   <button 
                     type="button" 
                     onClick={() => handleAction('vague')} 
-                    className="flex flex-col items-center justify-center gap-1 rounded-xl border border-border bg-background py-4 text-foreground hover:bg-accent/50 transition-colors"
+                    disabled={actionLoading}
+                    className="flex flex-col items-center justify-center gap-1 rounded-xl border border-border bg-background py-4 text-foreground hover:bg-accent/50 transition-colors disabled:opacity-60"
                   >
                     <span className="text-lg font-bold">有点模糊</span>
                     <span className="text-xs text-muted-foreground">近期再看</span>
@@ -196,7 +343,8 @@ export function ReviewModePage() {
                   <button 
                     type="button" 
                     onClick={() => handleAction('mastered')} 
-                    className="flex flex-col items-center justify-center gap-1 rounded-xl bg-emerald-500 py-4 text-white hover:bg-emerald-600 transition-colors shadow-sm"
+                    disabled={actionLoading}
+                    className="flex flex-col items-center justify-center gap-1 rounded-xl bg-emerald-500 py-4 text-white hover:bg-emerald-600 transition-colors shadow-sm disabled:opacity-60"
                   >
                     <span className="text-lg font-bold">完全掌握</span>
                     <span className="text-xs opacity-90">4天后复习</span>
@@ -288,7 +436,7 @@ export function ReviewModePage() {
                   contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 4px 20px rgba(0,0,0,0.1)' }}
                 />
                 <Bar dataKey="count" radius={[6, 6, 6, 6]} barSize={32}>
-                  {chartData.map((entry, index) => (
+                  {chartData.map((_, index) => (
                     <Cell key={`cell-${index}`} fill={index === chartData.length - 1 ? '#4F46E5' : '#E0E7FF'} />
                   ))}
                 </Bar>
