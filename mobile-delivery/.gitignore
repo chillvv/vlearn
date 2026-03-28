@@ -1,0 +1,8 @@
+node_modules/
+packages/mobile/node_modules/
+tests/visual/node_modules/
+packages/mobile/.expo/
+packages/mobile/dist/
+tests/visual/fixtures/diff.png
+tests/visual/fixtures/candidate.png
+packages/mobile/.env
