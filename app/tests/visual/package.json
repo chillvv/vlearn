@@ -1,0 +1,18 @@
+{
+  "name": "@aiweb/mobile-visual-tests",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "test": "tsx compare.ts --threshold 0.002",
+    "baseline": "tsx compare.ts --mode baseline",
+    "appium": "appium server --base-path /wd/hub"
+  },
+  "dependencies": {
+    "appium": "^3.1.0",
+    "pixelmatch": "^7.1.0",
+    "pngjs": "^7.0.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "webdriverio": "^9.20.0"
+  }
+}
