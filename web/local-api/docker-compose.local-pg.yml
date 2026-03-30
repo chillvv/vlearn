@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: ${LOCAL_PG_IMAGE:-docker.1ms.run/library/postgres:16}
+    container_name: vlearn-local-pg
+    environment:
+      POSTGRES_USER: root
+      POSTGRES_PASSWORD: root
+      POSTGRES_DB: vlearn
+    ports:
+      - "54333:5432"
+    volumes:
+      - vlearn_local_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U root -d vlearn"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  vlearn_local_pg_data:

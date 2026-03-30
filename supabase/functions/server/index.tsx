@@ -37,6 +37,12 @@ function fail(c: any, status: number, code: string, message: string, details?: u
   }, status);
 }
 
+function generateSecureShareCode() {
+  const bytes = new Uint8Array(4);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes).map((item) => item.toString(16).padStart(2, "0")).join("").toUpperCase();
+}
+
 // ---- Auth helpers ----
 async function getUserId(c: any): Promise<string | null> {
   const auth = c.req.header("Authorization");
@@ -230,7 +236,11 @@ app.post("/make-server-794e3fa7/questions/:id/review", async (c) => {
     const userId = await getUserId(c);
     if (!userId) return fail(c, 401, "UNAUTHORIZED", "未登录");
     const id = c.req.param("id");
-    const { isCorrect } = await c.req.json();
+    const body = await c.req.json();
+    if (typeof body?.isCorrect !== "boolean") {
+      return fail(c, 400, "VALIDATION_ERROR", "isCorrect 必须是布尔值");
+    }
+    const isCorrect = body.isCorrect;
     const question = await kv.get(`q:${userId}:${id}`);
     if (!question) return fail(c, 404, "NOT_FOUND", "错题不存在");
     const { newMastery, nextReview } = calculateNextReview(isCorrect, question.masteryLevel || 0);
@@ -288,7 +298,14 @@ app.post("/make-server-794e3fa7/chat/stream", async (c) => {
     if (!DASHSCOPE_API_KEY) {
       return fail(c, 500, "CONFIG_ERROR", "DashScope API密钥未配置，请在后台设置 DASHSCOPE_API_KEY 环境变量");
     }
-    const { messages } = await c.req.json();
+    const body = await c.req.json();
+    const messages = Array.isArray(body?.messages) ? body.messages : null;
+    const systemPrompt = typeof body?.systemPrompt === "string" && body.systemPrompt.trim().length > 0
+      ? body.systemPrompt
+      : AI_SYSTEM_PROMPT;
+    const enableThinking = typeof body?.enable_thinking === "boolean"
+      ? body.enable_thinking
+      : true;
     if (!messages || !Array.isArray(messages)) {
       return fail(c, 400, "VALIDATION_ERROR", "消息格式错误");
     }
@@ -300,11 +317,11 @@ app.post("/make-server-794e3fa7/chat/stream", async (c) => {
       },
       body: JSON.stringify({
         model: QWEN_MODEL,
-        messages: [{ role: "system", content: AI_SYSTEM_PROMPT }, ...messages],
+        messages: [{ role: "system", content: systemPrompt }, ...messages],
         stream: true,
         temperature: 0.7,
         max_tokens: 2000,
-        enable_thinking: true,
+        enable_thinking: enableThinking,
       }),
     });
     if (!upstream.ok) {
@@ -401,7 +418,7 @@ app.post("/make-server-794e3fa7/share", async (c) => {
     if (Array.isArray(questionIds) && questionIds.length > 0) {
       toShare = toShare.filter((q: any) => questionIds.includes(q.id));
     }
-    const code = Math.random().toString(36).substring(2, 10).toUpperCase();
+    const code = generateSecureShareCode();
     const shareData = {
       code,
       createdBy: userId,
