@@ -1,47 +1,10 @@
-import { userLearningStateApi } from './api';
-import type { Subject, TaxonomyOverrideMap } from './types';
+import { knowledgeNodesApi, taxonomyApi } from './api';
+import type { Subject } from './types';
 
 export type KnowledgeNodeMeta = {
   category: string;
   branch: string;
   node: string;
-};
-
-const ENGLISH_CATEGORY_MAP: Record<string, KnowledgeNodeMeta> = {
-  时态: { category: '语法', branch: '动词系统', node: '时态' },
-  主谓一致: { category: '语法', branch: '句法一致', node: '主谓一致' },
-  虚拟语气: { category: '语法', branch: '动词系统', node: '虚拟语气' },
-  从句: { category: '语法', branch: '句法结构', node: '从句' },
-  被动语态: { category: '语法', branch: '动词系统', node: '被动语态' },
-  非谓语动词: { category: '语法', branch: '动词系统', node: '非谓语动词' },
-  介词: { category: '词法', branch: '词性与用法', node: '介词' },
-  冠词: { category: '词法', branch: '词性与用法', node: '冠词' },
-  代词: { category: '词法', branch: '词性与用法', node: '代词' },
-  词形变化: { category: '词法', branch: '词形规则', node: '词形变化' },
-  词义辨析: { category: '词汇', branch: '词义语境', node: '词义辨析' },
-  固定搭配: { category: '词汇', branch: '固定搭配', node: '固定搭配' },
-  主旨理解: { category: '阅读', branch: '篇章理解', node: '主旨理解' },
-  细节理解: { category: '阅读', branch: '篇章理解', node: '细节理解' },
-  推理判断: { category: '阅读', branch: '篇章理解', node: '推理判断' },
-  句子结构: { category: '阅读', branch: '句子分析', node: '句子结构' },
-  逻辑连接: { category: '阅读', branch: '篇章逻辑', node: '逻辑连接' },
-  表达准确: { category: '写作', branch: '表达规范', node: '表达准确' },
-};
-
-const C_CATEGORY_MAP: Record<string, KnowledgeNodeMeta> = {
-  变量与数据类型: { category: '基础语法', branch: '类型系统', node: '变量与数据类型' },
-  运算符与表达式: { category: '基础语法', branch: '表达式规则', node: '运算符与表达式' },
-  选择结构: { category: '流程控制', branch: '分支判断', node: '选择结构' },
-  循环结构: { category: '流程控制', branch: '循环迭代', node: '循环结构' },
-  函数: { category: '函数与模块', branch: '函数设计', node: '函数' },
-  数组: { category: '数据结构', branch: '顺序存储', node: '数组' },
-  字符串: { category: '数据结构', branch: '字符处理', node: '字符串' },
-  指针: { category: '内存与指针', branch: '地址与引用', node: '指针' },
-  结构体: { category: '数据结构', branch: '复合类型', node: '结构体' },
-  文件操作: { category: '输入输出', branch: '文件读写', node: '文件操作' },
-  排序与查找: { category: '算法基础', branch: '排序查找', node: '排序与查找' },
-  内存管理: { category: '内存与指针', branch: '内存生命周期', node: '内存管理' },
-  边界条件: { category: '调试与健壮性', branch: '边界与异常', node: '边界条件' },
 };
 
 const DEFAULT_NODE: KnowledgeNodeMeta = {
@@ -50,123 +13,156 @@ const DEFAULT_NODE: KnowledgeNodeMeta = {
   node: '其他',
 };
 
-const TAXONOMY_OVERRIDES_KEY = 'mistake_taxonomy_overrides_v1';
-let runtimeOverrides: TaxonomyOverrideMap = {};
+type SubjectTaxonomyMap = Record<Subject, Record<string, KnowledgeNodeMeta>>;
+const runtimeTaxonomyMap: SubjectTaxonomyMap = { 英语: {}, C语言: {} };
+
+function getTaxonomyMap(subject: Subject) {
+  return runtimeTaxonomyMap[subject];
+}
 
 export function getKnowledgeNodeMeta(subject: Subject, knowledgePoint?: string): KnowledgeNodeMeta {
   if (!knowledgePoint) return DEFAULT_NODE;
-  if (subject === 'C语言') {
-    return C_CATEGORY_MAP[knowledgePoint] || { category: 'C语言其他', branch: '其他', node: knowledgePoint };
-  }
-  return ENGLISH_CATEGORY_MAP[knowledgePoint] || { category: '英语其他', branch: '其他', node: knowledgePoint };
+  const trimmed = knowledgePoint.trim();
+  const meta = getTaxonomyMap(subject)[trimmed];
+  if (meta) return meta;
+  return { category: `${subject}其他`, branch: '未分类', node: trimmed };
 }
 
 export function isKnowledgePointInSubjectTaxonomy(subject: Subject, knowledgePoint: string): boolean {
-  if (subject === 'C语言') {
-    return !!C_CATEGORY_MAP[knowledgePoint];
-  }
-  return !!ENGLISH_CATEGORY_MAP[knowledgePoint];
+  return Boolean(getTaxonomyMap(subject)[knowledgePoint]);
 }
 
-export function registerCustomKnowledgeTaxonomy(knowledgePoint: string, category: string, branch: string, subject: Subject) {
-  const normalized = { category, branch, node: knowledgePoint };
-  if (subject === 'C语言') {
-    C_CATEGORY_MAP[knowledgePoint] = normalized;
-  } else {
-    ENGLISH_CATEGORY_MAP[knowledgePoint] = normalized;
-  }
-  if (!runtimeOverrides[subject]) runtimeOverrides[subject] = {};
-  runtimeOverrides[subject]![knowledgePoint] = normalized;
-  writeTaxonomyOverrides(runtimeOverrides);
-  void persistTaxonomyOverridesToCloud(runtimeOverrides);
+export function getKnowledgePointsBySubjectFromTaxonomy(subject: Subject): string[] {
+  return Object.keys(getTaxonomyMap(subject));
 }
 
-export function renameCustomKnowledgeTaxonomy(oldKnowledgePoint: string, newKnowledgePoint: string, subject: Subject) {
+export function inferKnowledgeNodeMetaForNewTag(subject: Subject, knowledgePoint: string): KnowledgeNodeMeta {
+  const normalizedPoint = String(knowledgePoint || '').trim();
+  if (!normalizedPoint) return { category: `${subject}自定义`, branch: '未分类', node: knowledgePoint };
+  const existing = getTaxonomyMap(subject)[normalizedPoint];
+  if (existing) return existing;
+  const bySimilarity = inferBySimilarity(subject, normalizedPoint);
+  if (bySimilarity) return { category: bySimilarity.category, branch: bySimilarity.branch, node: normalizedPoint };
+  const byKeyword = inferByKeyword(subject, normalizedPoint);
+  if (byKeyword) return { category: byKeyword.category, branch: '未分类', node: normalizedPoint };
+  return { category: `${subject}自定义`, branch: '未分类', node: normalizedPoint };
+}
+
+export async function registerCustomKnowledgeTaxonomy(knowledgePoint: string, category: string, branch: string, subject: Subject) {
+  const normalizedPoint = String(knowledgePoint || '').trim();
+  const normalizedCategory = String(category || '').trim();
+  const normalizedBranch = String(branch || '').trim() || '未分类';
+  if (!normalizedPoint || !normalizedCategory) return;
+  const current = getTaxonomyMap(subject);
+  const previous = current[normalizedPoint];
+  const normalized = { category: normalizedCategory, branch: normalizedBranch, node: normalizedPoint };
+  current[normalizedPoint] = normalized;
+  try {
+    await taxonomyApi.upsertKnowledgePoint({
+      subject,
+      knowledgePoint: normalizedPoint,
+      category: normalizedCategory,
+      branch: normalizedBranch,
+    });
+  } catch (error) {
+    if (previous) current[normalizedPoint] = previous;
+    else delete current[normalizedPoint];
+    throw error;
+  }
+}
+
+export async function renameCustomKnowledgeTaxonomy(oldKnowledgePoint: string, newKnowledgePoint: string, subject: Subject) {
   if (!oldKnowledgePoint || !newKnowledgePoint || oldKnowledgePoint === newKnowledgePoint) return;
-  const current = runtimeOverrides[subject] || {};
+  const current = getTaxonomyMap(subject);
   const oldMeta = current[oldKnowledgePoint] || getKnowledgeNodeMeta(subject, oldKnowledgePoint);
-  registerCustomKnowledgeTaxonomy(newKnowledgePoint, oldMeta.category, oldMeta.branch, subject);
-  removeCustomKnowledgeTaxonomy(oldKnowledgePoint, subject);
+  await registerCustomKnowledgeTaxonomy(newKnowledgePoint, oldMeta.category, oldMeta.branch, subject);
+  await removeCustomKnowledgeTaxonomy(oldKnowledgePoint, subject, oldMeta.category);
 }
 
-export function removeCustomKnowledgeTaxonomy(knowledgePoint: string, subject: Subject) {
-  const targetMap = subject === 'C语言' ? C_CATEGORY_MAP : ENGLISH_CATEGORY_MAP;
-  const hadOverride = Boolean(runtimeOverrides[subject]?.[knowledgePoint]);
-  if (runtimeOverrides[subject]?.[knowledgePoint]) {
-    delete runtimeOverrides[subject]![knowledgePoint];
-    if (Object.keys(runtimeOverrides[subject] || {}).length === 0) {
-      delete runtimeOverrides[subject];
-    }
-    writeTaxonomyOverrides(runtimeOverrides);
-    void persistTaxonomyOverridesToCloud(runtimeOverrides);
-  }
-  if (hadOverride && targetMap[knowledgePoint]) {
-    delete targetMap[knowledgePoint];
+export async function removeCustomKnowledgeTaxonomy(knowledgePoint: string, subject: Subject, category?: string) {
+  const current = getTaxonomyMap(subject);
+  const previous = current[knowledgePoint];
+  delete current[knowledgePoint];
+  try {
+    await knowledgeNodesApi.deleteNode(subject, knowledgePoint, category || previous?.category);
+  } catch (error) {
+    if (previous) current[knowledgePoint] = previous;
+    throw error;
   }
 }
 
 export async function hydrateTaxonomyOverridesFromCloud() {
   if (typeof window === 'undefined') return;
   try {
-    const localOverrides = readTaxonomyOverrides();
-    const remote = await userLearningStateApi.get();
-    const remoteOverrides = (remote.taxonomy_overrides || {}) as TaxonomyOverrideMap;
-    if (hasTaxonomyOverrides(remoteOverrides)) {
-      runtimeOverrides = remoteOverrides;
-      applyTaxonomyOverrides(remoteOverrides);
-      writeTaxonomyOverrides(remoteOverrides);
-      return;
-    }
-    runtimeOverrides = localOverrides;
-    applyTaxonomyOverrides(localOverrides);
-    if (hasTaxonomyOverrides(localOverrides)) {
-      await persistTaxonomyOverridesToCloud(localOverrides);
-    }
+    const nodes = await knowledgeNodesApi.getAll().catch(() => []);
+    replaceTaxonomyMapFromNodes(nodes);
   } catch {
+    runtimeTaxonomyMap.英语 = {};
+    runtimeTaxonomyMap.C语言 = {};
   }
 }
 
-export async function persistTaxonomyOverridesToCloud(overrides?: TaxonomyOverrideMap) {
-  if (typeof window === 'undefined') return;
-  try {
-    await userLearningStateApi.upsert({
-      taxonomy_overrides: overrides || runtimeOverrides,
-    });
-  } catch {
-  }
+export async function persistTaxonomyOverridesToCloud() {
 }
 
-function applyTaxonomyOverrides(overrides: TaxonomyOverrideMap) {
-  Object.entries(overrides.英语 || {}).forEach(([knowledgePoint, meta]) => {
-    ENGLISH_CATEGORY_MAP[knowledgePoint] = meta;
-  });
-  Object.entries(overrides.C语言 || {}).forEach(([knowledgePoint, meta]) => {
-    C_CATEGORY_MAP[knowledgePoint] = meta;
+function replaceTaxonomyMapFromNodes(nodes: Array<any>) {
+  runtimeTaxonomyMap.英语 = {};
+  runtimeTaxonomyMap.C语言 = {};
+  nodes.forEach((item) => {
+    const subject = item.subject === 'C语言' ? 'C语言' : item.subject === '英语' ? '英语' : null;
+    if (!subject) return;
+    const node = String(item.node || item.tag_name || '').trim();
+    const category = String(item.category || '').trim() || '未分类';
+    const branch = String(item.branch || '').trim() || '其他';
+    if (!node) return;
+    runtimeTaxonomyMap[subject][node] = {
+      category,
+      branch,
+      node,
+    };
   });
 }
 
-function readTaxonomyOverrides(): TaxonomyOverrideMap {
-  if (typeof window === 'undefined') return {};
-  try {
-    const raw = window.localStorage.getItem(TAXONOMY_OVERRIDES_KEY);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === 'object' ? parsed : {};
-  } catch {
-    return {};
-  }
+function inferBySimilarity(subject: Subject, knowledgePoint: string): KnowledgeNodeMeta | null {
+  const entries = Object.entries(getTaxonomyMap(subject));
+  let best: { score: number; meta: KnowledgeNodeMeta } | null = null;
+  entries.forEach(([node, meta]) => {
+    const score = computeSimilarityScore(knowledgePoint, node);
+    if (!best || score > best.score) {
+      best = { score, meta };
+    }
+  });
+  if (!best || best.score < 4) return null;
+  return best.meta;
 }
 
-function writeTaxonomyOverrides(overrides: TaxonomyOverrideMap) {
-  if (typeof window === 'undefined') return;
-  window.localStorage.setItem(TAXONOMY_OVERRIDES_KEY, JSON.stringify(overrides));
+function computeSimilarityScore(a: string, b: string) {
+  const left = a.trim();
+  const right = b.trim();
+  if (!left || !right) return 0;
+  if (left === right) return 100;
+  if (left.includes(right) || right.includes(left)) return 60 + Math.min(left.length, right.length);
+  const leftChars = new Set(left.split(''));
+  const shared = right.split('').filter(char => leftChars.has(char)).length;
+  const prefix = getCommonPrefixLen(left, right);
+  return shared * 2 + prefix * 3;
 }
 
-function hasTaxonomyOverrides(overrides: TaxonomyOverrideMap) {
-  return Object.keys(overrides.英语 || {}).length > 0 || Object.keys(overrides.C语言 || {}).length > 0;
+function getCommonPrefixLen(a: string, b: string) {
+  const max = Math.min(a.length, b.length);
+  let idx = 0;
+  while (idx < max && a[idx] === b[idx]) idx += 1;
+  return idx;
 }
 
-if (typeof window !== 'undefined') {
-  runtimeOverrides = readTaxonomyOverrides();
-  applyTaxonomyOverrides(runtimeOverrides);
+function inferByKeyword(subject: Subject, knowledgePoint: string): { category: string } | null {
+  const text = knowledgePoint.trim();
+  if (!text) return null;
+  const matched = (subject === '英语' ? ENGLISH_KEYWORD_HINTS : C_KEYWORD_HINTS).find(item => item.pattern.test(text));
+  if (!matched) return null;
+  return { category: matched.category };
 }
+
+const ENGLISH_KEYWORD_HINTS: Array<{ pattern: RegExp; category: string }> = [];
+
+const C_KEYWORD_HINTS: Array<{ pattern: RegExp; category: string }> = [];

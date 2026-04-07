@@ -7,7 +7,7 @@ services:
       POSTGRES_PASSWORD: root
       POSTGRES_DB: vlearn
     ports:
-      - "54333:5432"
+      - "44333:5432"
     volumes:
       - vlearn_local_pg_data:/var/lib/postgresql/data
     healthcheck:

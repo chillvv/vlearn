@@ -50,10 +50,12 @@ const ENGLISH_BLUEPRINT_META = [
   { category: '语法', node: '从句', ability: '知识点定位', errorType: '从句' },
   { category: '语法', node: '被动语态', ability: '规则应用', errorType: '写作表达' },
   { category: '语法', node: '非谓语动词', ability: '规则应用', errorType: '非谓语动词' },
-  { category: '词汇', node: '介词', ability: '表达输出', errorType: '词义辨析' },
-  { category: '词汇', node: '冠词', ability: '知识点定位', errorType: '词义辨析' },
-  { category: '词汇', node: '代词', ability: '规则应用', errorType: '词义辨析' },
-  { category: '词汇', node: '词形变化', ability: '表达输出', errorType: '词义辨析' },
+  { category: '语法', node: '特殊句式', ability: '知识点定位', errorType: '特殊句式' },
+  { category: '词法', node: '介词', ability: '表达输出', errorType: '词义辨析' },
+  { category: '词法', node: '冠词', ability: '知识点定位', errorType: '词义辨析' },
+  { category: '词法', node: '代词', ability: '规则应用', errorType: '词义辨析' },
+  { category: '词法', node: '词形变化', ability: '表达输出', errorType: '词义辨析' },
+  { category: '词法', node: '形容词与副词', ability: '规则应用', errorType: '形容词与副词' },
   { category: '词汇', node: '词义辨析', ability: '知识点定位', errorType: '词义辨析' },
   { category: '词汇', node: '固定搭配', ability: '规则应用', errorType: '固定搭配' },
   { category: '阅读', node: '主旨理解', ability: '步骤执行', errorType: '阅读主旨' },
@@ -61,7 +63,11 @@ const ENGLISH_BLUEPRINT_META = [
   { category: '阅读', node: '推理判断', ability: '规则应用', errorType: '阅读推理' },
   { category: '阅读', node: '句子结构', ability: '知识点定位', errorType: '阅读推理' },
   { category: '阅读', node: '逻辑连接', ability: '步骤执行', errorType: '阅读推理' },
+  { category: '阅读', node: '词义猜测', ability: '知识点定位', errorType: '词义猜测' },
   { category: '写作', node: '表达准确', ability: '表达输出', errorType: '写作表达' },
+  { category: '听力', node: '听力理解', ability: '步骤执行', errorType: '听力理解' },
+  { category: '翻译', node: '翻译技巧', ability: '表达输出', errorType: '翻译技巧' },
+  { category: '综合', node: '完型填空', ability: '规则应用', errorType: '完型填空' },
 ];
 
 const C_BLUEPRINT_META = [
@@ -78,6 +84,12 @@ const C_BLUEPRINT_META = [
   { category: '算法', node: '排序与查找', ability: '规则应用', errorType: '排序查找' },
   { category: '语法进阶', node: '内存管理', ability: '步骤执行', errorType: '内存管理' },
   { category: '算法', node: '边界条件', ability: '规则应用', errorType: '边界条件' },
+  { category: '基础语法', node: '预处理与宏定义', ability: '知识点定位', errorType: '预处理与宏定义' },
+  { category: '算法基础', node: '位运算', ability: '步骤执行', errorType: '位运算' },
+  { category: '函数与模块', node: '递归算法', ability: '规则应用', errorType: '递归算法' },
+  { category: '数据结构', node: '共用体与枚举', ability: '知识点定位', errorType: '共用体与枚举' },
+  { category: '内存与指针', node: '函数指针', ability: '规则应用', errorType: '函数指针' },
+  { category: '输入输出', node: '格式化输入输出', ability: '步骤执行', errorType: '格式化输入输出' },
 ];
 
  const ENGLISH_WRITING_EVIDENCE_BANK = [
@@ -171,10 +183,12 @@ function buildEnglishExamStems(node) {
     从句: { text: '【专升本填空】This is the lab ____ we tested the new device last semester.', answer: 'where' },
     被动语态: { text: '【专升本填空】The survey report ____ (finish) before Monday morning.', answer: 'must be finished' },
     非谓语动词: { text: '【专升本填空】____ (compare) with last year, this plan is more practical.', answer: 'Compared' },
+    特殊句式: { text: '【专升本填空】Only then ____ (do) he realize his mistake.', answer: 'did' },
     介词: { text: '【专升本填空】The students are responsible ____ checking the references.', answer: 'for' },
     冠词: { text: '【专升本填空】It is ____ honor to represent our class in the final speech.', answer: 'an' },
     代词: { text: '【专升本填空】Everyone should submit ____ own reflection after class.', answer: 'his or her' },
     词形变化: { text: '【专升本填空】Her explanation is clear and highly ____ (persuade).', answer: 'persuasive' },
+    形容词与副词: { text: '【专升本填空】She speaks English as ____ (fluent) as a native speaker.', answer: 'fluently' },
     词义辨析: { text: '【专升本填空】The medicine can ____ the pain but cannot remove the cause.', answer: 'relieve' },
     固定搭配: { text: '【专升本填空】The manager asked us to carry ____ the safety check immediately.', answer: 'out' },
     主旨理解: { text: '【主旨概括】短文围绕“旧校舍改造后辍学率下降”。请写出英文主旨句（不超过18词）。', answer: 'Renovated school spaces improved learning engagement and reduced dropout rates.' },
@@ -182,7 +196,11 @@ function buildEnglishExamStems(node) {
     推理判断: { text: '【推理判断】根据“她放弃短期利润并投入培训”，推断其经营取向并用英文作答。', answer: 'She values long-term development.' },
     句子结构: { text: '【句子分析】指出句子主干：Although the road was icy, the driver continued slowly.', answer: 'the driver continued slowly' },
     逻辑连接: { text: '【衔接填空】The data were incomplete; ____ , the team delayed the final decision.', answer: 'therefore' },
+    词义猜测: { text: '【词义猜测】推测画线词 "indispensable" 的意思。', answer: 'essential / absolutely necessary' },
     表达准确: { text: '【改错重写】Many student has trouble on manage time.（写出正确句）', answer: 'Many students have trouble managing time.' },
+    听力理解: { text: '【听力记录】The flight will arrive at ____ (时间).', answer: '10:30 AM' },
+    翻译技巧: { text: '【句子翻译】把“众所周知，中国有悠久的历史”翻译为英文。', answer: 'As is known to all, China has a long history.' },
+    完型填空: { text: '【完型填空】He tried hard, ____ failed again.', answer: 'but' },
   };
   const weakEssayByNode = {
     虚拟语气: '【短文写作】用“与现在事实相反”和“与过去事实相反”各造1句，并写1句个人反思（60-90词）。',
@@ -229,6 +247,36 @@ function buildCExamStems(node) {
       fill: { text: '【填空题】feof(fp)在____之后才会返回真。', answer: '读取失败|读操作失败' },
       read: { text: '【程序阅读】fseek(fp,0,SEEK_END); long n=ftell(fp); n表示什么？', answer: '文件字节长度|文件末尾位置' },
       code: { text: '【程序填空】以二进制追加模式打开文件：fopen("data.bin", "____");', answer: 'ab' },
+    },
+    预处理与宏定义: {
+      fill: { text: '【填空题】预处理指令通常以____符号开头。', answer: '#' },
+      read: { text: '【程序阅读】#define SQR(x) x*x; printf("%d", SQR(3+1)); 输出？', answer: '7' },
+      code: { text: '【程序填空】定义求最大值的宏：#define MAX(a,b) ((a)>(b)?(a):____)', answer: '(b)' },
+    },
+    位运算: {
+      fill: { text: '【填空题】将变量x的第n位置1，通常使用x ____ (1<<n)。', answer: '|=' },
+      read: { text: '【程序阅读】int a=5, b=3; a=a^b; b=a^b; a=a^b; printf("%d %d", a, b); 输出？', answer: '3 5' },
+      code: { text: '【程序填空】判断x是否为奇数：if(x ____ 1) ', answer: '&' },
+    },
+    递归算法: {
+      fill: { text: '【填空题】递归函数必须包含____条件以防止无限调用。', answer: '终止|结束' },
+      read: { text: '【程序阅读】int f(int n) { if(n<=1) return 1; return n*f(n-1); } f(4)输出？', answer: '24' },
+      code: { text: '【程序填空】斐波那契递归：if(n<=2) return 1; else return f(n-1)+____;', answer: 'f(n-2)' },
+    },
+    共用体与枚举: {
+      fill: { text: '【填空题】共用体所有成员共享同一块____。', answer: '内存|存储空间' },
+      read: { text: '【程序阅读】enum Color { RED=1, GREEN, BLUE }; printf("%d", BLUE); 输出？', answer: '3' },
+      code: { text: '【程序填空】定义包含int和float的共用体：____ Data { int i; float f; };', answer: 'union' },
+    },
+    函数指针: {
+      fill: { text: '【填空题】指向函数 int func(int) 的指针p声明为 int (*p)____;', answer: '(int)' },
+      read: { text: '【程序阅读】int f(int x){return x+1;} int (*p)(int)=f; printf("%d", p(2)); 输出？', answer: '3' },
+      code: { text: '【程序填空】将函数max赋给函数指针p：p = ____;', answer: 'max' },
+    },
+    格式化输入输出: {
+      fill: { text: '【填空题】读取double类型变量时，scanf必须使用格式符____。', answer: '%lf' },
+      read: { text: '【程序阅读】printf("%05d", 12); 输出？', answer: '00012' },
+      code: { text: '【程序填空】使用scanf读取字符串到数组s中：scanf("%s", ____);', answer: 's' },
     },
     默认: null,
   };
@@ -405,19 +453,19 @@ async function seedQuestions(client, userId) {
 async function seedWeakness(client, userId, insertedQuestions) {
   const grouped = new Map();
   for (const item of insertedQuestions) {
-    const key = `${item.knowledge_point}::${item.ability}`;
-    const current = grouped.get(key) || { knowledge_point: item.knowledge_point, ability: item.ability, count: 0 };
+    const key = item.knowledge_point;
+    const current = grouped.get(key) || { knowledge_point: item.knowledge_point, count: 0 };
     current.count += 1;
     grouped.set(key, current);
   }
   for (const value of grouped.values()) {
     const errorCount = value.count * 2 + 1;
     await client.query(
-      `INSERT INTO user_weakness (user_id, knowledge_point, ability, error_count, last_updated)
-       VALUES ($1,$2,$3,$4,NOW())
-       ON CONFLICT (user_id, knowledge_point, ability)
+      `INSERT INTO user_weakness (user_id, knowledge_point, error_count, last_updated)
+       VALUES ($1,$2,$3,NOW())
+       ON CONFLICT (user_id, knowledge_point)
        DO UPDATE SET error_count = EXCLUDED.error_count, last_updated = NOW()`,
-      [userId, value.knowledge_point, value.ability, errorCount],
+      [userId, value.knowledge_point, errorCount],
     );
   }
 }

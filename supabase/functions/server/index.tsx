@@ -21,7 +21,7 @@ app.use(
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const DASHSCOPE_API_KEY = Deno.env.get("DASHSCOPE_API_KEY");
-const QWEN_MODEL = Deno.env.get("QWEN_MODEL") || "qwen3.5-flash";
+const QWEN_MODEL = Deno.env.get("QWEN_MODEL") || "qwen3.5-plus";
 const QWEN_BASE_URL = Deno.env.get("QWEN_BASE_URL") || "https://dashscope.aliyuncs.com/compatible-mode/v1";
 
 function fail(c: any, status: number, code: string, message: string, details?: unknown) {

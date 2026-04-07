@@ -6,10 +6,12 @@ const root = path.resolve(process.cwd());
 const apiPath = path.join(root, 'src', 'app', 'lib', 'api.ts');
 const copilotPath = path.join(root, 'src', 'app', 'lib', 'copilot.ts');
 const nodeHubPath = path.join(root, 'src', 'app', 'pages', 'MistakeNodeHubPage.tsx');
+const draftPagePath = path.join(root, 'src', 'app', 'pages', 'DraftReviewPage.tsx');
 
 const apiSource = readFileSync(apiPath, 'utf-8');
 const copilotSource = readFileSync(copilotPath, 'utf-8');
 const nodeHubSource = readFileSync(nodeHubPath, 'utf-8');
+const draftPageSource = readFileSync(draftPagePath, 'utf-8');
 
 assert.match(copilotSource, /export function collectMissingTagExtensions\(/, '缺少新标签检测函数 collectMissingTagExtensions');
 assert.match(nodeHubSource, /title:\s*'发现新标签，是否创建\？'/, '缺少“新标签确认创建”弹窗');
@@ -21,5 +23,8 @@ assert.match(apiSource, /questionsApi\.getAll\(\{ sortBy: 'latestWrong' \}, \{ f
 assert.match(apiSource, /weaknessApi\.getAll\(\{ forceRefresh: true \}\)/, '弱点画像未强制刷新弱点数据');
 assert.match(nodeHubSource, /syncKnowledgeFromMistake\(created\);/, '新增错题后未联动知识点沉淀');
 assert.match(nodeHubSource, /syncKnowledgeFromMistake\(updated\);/, '更新错题后未联动知识点沉淀');
+assert.match(draftPageSource, /const \[modeSelectionSource, setModeSelectionSource\] = useState<'auto' \| 'manual'>\('auto'\);/, 'AI 管家缺少手动\/自动模式来源状态');
+assert.match(draftPageSource, /const resolvedMode = modeSelectionSource === 'manual' && !shouldRefinePendingDraft \? currentMode : inferredMode;/, 'AI 管家未优先尊重用户手动选择的模式');
+assert.match(draftPageSource, /COPILOT_MODES\.map\(\(mode\) => \{/, 'AI 管家缺少三模式切换入口');
 
 process.stdout.write('AI guardrails acceptance checks passed.\n');

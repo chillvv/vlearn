@@ -11,15 +11,15 @@ export const SUBJECTS = [
 ] as const;
 
 export const SUB_TOPICS: Record<string, string[]> = {
-  数学: ['函数与导数', '三角函数', '数列', '概率与统计', '立体几何', '解析几何', '不等式', '复数', '集合与逻辑'],
-  英语: ['完型填空', '语法填空', '阅读理解', '书面表达', '词汇运用', '听力理解', '翻译'],
-  物理: ['运动学', '力学', '电磁学', '光学与波动', '热学', '量子物理', '电路分析'],
-  化学: ['有机化学', '无机化学', '化学反应原理', '电化学', '元素周期律', '化学实验'],
-  生物: ['细胞生物学', '遗传学', '生态学', '进化论', '生命活动调节', '生物技术'],
-  历史: ['中国古代史', '中国近代史', '中国现代史', '世界古代史', '世界近现代史'],
-  地理: ['自然地理', '人文地理', '区域地理', '地图与工具'],
-  政治: ['马克思主义哲学', '政治经济学', '政治学', '文化学'],
-  C语言: ['变量与数据类型', '运算符与表达式', '选择结构', '循环结构', '函数', '数组', '字符串', '指针', '结构体', '文件操作', '排序与查找', '内存管理', '边界条件'],
+  数学: [],
+  英语: [],
+  物理: [],
+  化学: [],
+  生物: [],
+  历史: [],
+  地理: [],
+  政治: [],
+  C语言: [],
 };
 
 export const COMMON_ERROR_TAGS = [
@@ -27,15 +27,15 @@ export const COMMON_ERROR_TAGS = [
 ];
 
 export const SUBJECT_ERROR_TAGS: Record<string, string[]> = {
-  数学: ['计算错误', '公式记错', '概念混淆', '逻辑漏洞', '步骤缺失', '分类讨论遗漏'],
-  英语: ['时态', '主谓一致', '虚拟语气', '从句', '非谓语动词', '词义辨析', '固定搭配', '阅读主旨', '阅读细节', '阅读推理', '写作表达'],
-  物理: ['受力分析', '公式错用', '单位换算', '模型构建', '实验原理', '图像分析'],
-  化学: ['方程式配平', '反应条件', '物质性质', '实验现象', '计算错误', '离子共存'],
-  生物: ['概念辨析', '图表分析', '实验设计', '遗传规律', '代谢过程'],
-  历史: ['时间混淆', '因果倒置', '史实错误', '观点偏颇', '材料误读'],
-  地理: ['定位错误', '成因分析', '特征描述', '规律应用', '读图错误'],
-  政治: ['原理错用', '主体混淆', '表述不当', '逻辑混乱', '时政结合'],
-  C语言: ['数据类型', '运算表达式', '分支循环', '函数调用', '数组', '字符串', '指针', '结构体', '文件操作', '内存管理', '边界条件', '排序查找'],
+  数学: [],
+  英语: [],
+  物理: [],
+  化学: [],
+  生物: [],
+  历史: [],
+  地理: [],
+  政治: [],
+  C语言: [],
 };
 
 export const ERROR_TAGS = COMMON_ERROR_TAGS; // Fallback
@@ -84,6 +84,16 @@ export const ERROR_TAG_COLORS: Record<string, { bg: string; text: string }> = {
   阅读细节: { bg: 'bg-purple-100', text: 'text-purple-700' },
   阅读推理: { bg: 'bg-fuchsia-100', text: 'text-fuchsia-700' },
   写作表达: { bg: 'bg-pink-100', text: 'text-pink-700' },
+  特殊句式: { bg: 'bg-emerald-100', text: 'text-emerald-700' },
+  形容词与副词: { bg: 'bg-green-100', text: 'text-green-700' },
+  词义猜测: { bg: 'bg-lime-100', text: 'text-lime-700' },
+  听力理解: { bg: 'bg-cyan-100', text: 'text-cyan-700' },
+  翻译技巧: { bg: 'bg-sky-100', text: 'text-sky-700' },
+  完型填空: { bg: 'bg-blue-100', text: 'text-blue-700' },
+  介词: { bg: 'bg-indigo-100', text: 'text-indigo-700' },
+  冠词: { bg: 'bg-violet-100', text: 'text-violet-700' },
+  代词: { bg: 'bg-purple-100', text: 'text-purple-700' },
+  词形变化: { bg: 'bg-fuchsia-100', text: 'text-fuchsia-700' },
   数据类型: { bg: 'bg-amber-100', text: 'text-amber-700' },
   运算表达式: { bg: 'bg-orange-100', text: 'text-orange-700' },
   分支循环: { bg: 'bg-yellow-100', text: 'text-yellow-700' },
@@ -96,6 +106,15 @@ export const ERROR_TAG_COLORS: Record<string, { bg: string; text: string }> = {
   内存管理: { bg: 'bg-zinc-100', text: 'text-zinc-700' },
   边界条件: { bg: 'bg-neutral-100', text: 'text-neutral-700' },
   排序查找: { bg: 'bg-gray-100', text: 'text-gray-700' },
+  预处理与宏定义: { bg: 'bg-amber-100', text: 'text-amber-700' },
+  位运算: { bg: 'bg-orange-100', text: 'text-orange-700' },
+  递归算法: { bg: 'bg-yellow-100', text: 'text-yellow-700' },
+  共用体与枚举: { bg: 'bg-teal-100', text: 'text-teal-700' },
+  函数指针: { bg: 'bg-rose-100', text: 'text-rose-700' },
+  格式化输入输出: { bg: 'bg-red-100', text: 'text-red-700' },
+  二维数组与数组指针: { bg: 'bg-slate-100', text: 'text-slate-700' },
+  存储类别: { bg: 'bg-stone-100', text: 'text-stone-700' },
+  进制转换: { bg: 'bg-zinc-100', text: 'text-zinc-700' },
 };
 
 export function getErrorTagColor(tag: string) {

@@ -5,6 +5,7 @@ import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell, Cartes
 import { ArrowLeft, BarChart3, AlertTriangle, PieChart as PieChartIcon } from 'lucide-react';
 import { useQuery } from '@tanstack/react-query';
 import { queryKeys } from '../lib/queryKeys';
+import { buildLearningSessionNavigation, createLearningSessionProposal } from '../lib/learningSession';
 
 const REVIEW_PATTERN_LABELS: Record<string, string> = {
   repeat_same_option: '重复误选',
@@ -32,7 +33,7 @@ export function ReviewStatsPage() {
     staleTime: 60 * 1000,
   });
   const stats = (statsQuery.data || []) as StatRecord[];
-  const loading = statsQuery.isLoading || statsQuery.isFetching;
+  const loading = statsQuery.isLoading;
   const loadError = statsQuery.error instanceof Error ? statsQuery.error.message : '';
 
   // Aggregate by pattern for Pie chart
@@ -62,13 +63,36 @@ export function ReviewStatsPage() {
     record.total = total;
     return record;
   });
+  const reviewEntry = buildLearningSessionNavigation(createLearningSessionProposal({
+    sessionKind: 'review',
+    sourceSurface: 'review-stats',
+    sourceReason: '用户从错因分析页返回复习中心',
+    objectiveCode: 'review_due',
+    explanationSummary: '根据错因分析结果回到正式复习页',
+    scope: {
+      subject: '英语',
+      amount: 10,
+      reviewScope: 'due',
+      sortBy: 'nearestDue',
+    },
+    returnPath: {
+      pathname: '/review-stats',
+      search: '',
+      label: '回到错因分析',
+    },
+  }));
 
   return (
     <main className="mx-auto w-full max-w-5xl space-y-6 px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">
           <button 
-            onClick={() => navigate('/review')}
+            onClick={() => navigate({
+              pathname: reviewEntry.pathname,
+              search: reviewEntry.search,
+            }, {
+              state: reviewEntry.state,
+            })}
             className="p-2 hover:bg-secondary/80 rounded-full transition-colors"
           >
             <ArrowLeft className="w-6 h-6 text-foreground" />

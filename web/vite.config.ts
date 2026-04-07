@@ -29,4 +29,20 @@ export default defineConfig({
       },
     },
   },
+  esbuild: {
+    drop: ['console', 'debugger'],
+  },
+  build: {
+    target: 'esnext',
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          'vendor-react': ['react', 'react-dom', 'react-router'],
+          'vendor-ui': ['@radix-ui/react-accordion', '@radix-ui/react-dialog', '@radix-ui/react-dropdown-menu', '@radix-ui/react-popover', 'lucide-react', 'sonner'],
+          'vendor-supabase': ['@supabase/supabase-js'],
+          'vendor-math': ['katex', 'react-katex', 'react-markdown', 'remark-math', 'rehype-katex'],
+        },
+      },
+    },
+  },
 })

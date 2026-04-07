@@ -3,8 +3,8 @@ import { questionsApi } from '../lib/api';
 import { queryKeys } from '../lib/queryKeys';
 import type { Question, SubmitReviewAttemptInput } from '../lib/types';
 
-function patchQuestionInList(list: Question[] | undefined, nextQuestion: Question) {
-  if (!Array.isArray(list)) return list;
+function patchQuestionInList(list: Question[] | undefined, nextQuestion?: Question | null) {
+  if (!Array.isArray(list) || !nextQuestion?.id) return list;
   return list.map((item) => (item.id === nextQuestion.id ? nextQuestion : item));
 }
 

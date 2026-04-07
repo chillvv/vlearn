@@ -152,12 +152,9 @@ async function listMigrationFiles() {
     });
 }
 
-async function isApplied(name) {
-  const result = await pool.query(
-    'SELECT 1 FROM public.local_migration_history WHERE name = $1 LIMIT 1',
-    [name],
-  );
-  return result.rowCount > 0;
+async function getAppliedMigrationNames() {
+  const result = await pool.query('SELECT name FROM public.local_migration_history');
+  return new Set((result.rows || []).map((row) => String(row.name || '').trim()).filter(Boolean));
 }
 
 async function markApplied(client, name) {
@@ -199,20 +196,25 @@ async function main() {
   await ensureSharedQuestionsTable();
   await ensureHistoryTable();
   const files = await listMigrationFiles();
-  for (const name of files) {
-    await ensureQuestionsCompatColumns();
-    const applied = await isApplied(name);
-    if (applied) {
-      process.stdout.write(`skip: ${name}\n`);
-      continue;
-    }
+  const appliedNames = await getAppliedMigrationNames();
+  await ensureQuestionsCompatColumns();
+  const pendingFiles = files.filter((name) => !appliedNames.has(name));
+  if (pendingFiles.length === 0) {
+    process.stdout.write('local database already up to date\n');
+    process.stdout.write('local database migrations completed\n');
+    return;
+  }
+  for (const name of pendingFiles) {
     if (name.includes('mock_questions')) {
       await markAppliedDirect(name);
+      appliedNames.add(name);
       process.stdout.write(`skip legacy seed migration: ${name}\n`);
       continue;
     }
     await applyOne(name);
+    appliedNames.add(name);
   }
+  await ensureQuestionsCompatColumns();
   process.stdout.write('local database migrations completed\n');
 }
 

@@ -5,6 +5,7 @@ CREATE OR REPLACE FUNCTION public.create_question(
   p_node TEXT DEFAULT NULL,
   p_image_url TEXT DEFAULT NULL,
   p_knowledge_point TEXT DEFAULT NULL,
+  p_mistake_point TEXT DEFAULT NULL,
   p_ability TEXT DEFAULT NULL,
   p_error_type TEXT DEFAULT NULL,
   p_question_type TEXT DEFAULT NULL,
@@ -36,13 +37,19 @@ BEGIN
 
   INSERT INTO questions (
     user_id, subject, question_text, category, node, image_url,
-    knowledge_point, ability, error_type, question_type, correct_answer,
+    knowledge_point,
+    mistake_point,
+    ability,
+    error_type, question_type, correct_answer,
     raw_ai_response, normalized_payload, payload_version, validation_status,
     render_mode, note, summary, confidence, mastery_level,
     next_review_date, stubborn_flag, review_count
   ) VALUES (
     v_user, p_subject, p_question_text, p_category, p_node, p_image_url,
-    p_knowledge_point, p_ability, p_error_type, p_question_type, p_correct_answer,
+    p_knowledge_point,
+    p_mistake_point,
+    p_ability,
+    p_error_type, p_question_type, p_correct_answer,
     p_raw_ai_response, p_normalized_payload, p_payload_version, p_validation_status,
     p_render_mode, p_note, p_summary, p_confidence, p_mastery_level,
     p_next_review_date, p_stubborn_flag, p_review_count

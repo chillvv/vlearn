@@ -1,10 +1,27 @@
 import { createClient } from '@supabase/supabase-js';
 import { projectId, publicAnonKey } from '../../../utils/supabase/info';
 import type {
+  GovernedGenerationRequest,
+  GovernedGenerationResult,
   LearningContentState,
+  LearningTelemetryEventInput,
+  LearningWritebackContext,
+  NodeDossier,
+  NodeDossierFileExport,
+  NodeDossierQuery,
+  NodeDossierSortMetric,
+  NodeDossierSortStrategy,
+  NodeMistakeIndexEntry,
+  NodeMistakeLookupQuery,
+  PlanTelemetry,
+  PlannerInputPayload,
+  PlannerOutputPayload,
+  PlannerQueueItem,
   Question,
   QuestionQuery,
   ReviewAttemptRecord,
+  ReviewPlannerRunInput,
+  ReviewPlannerRunResult,
   SubmitReviewAttemptInput,
   SubmitReviewAttemptResult,
   Stats,
@@ -15,7 +32,16 @@ import type {
   UserWeakness,
   VariantQuestion,
 } from './types';
-import { ABILITIES, getErrorTypesBySubject, getKnowledgePointsBySubject } from './types';
+import { applyRuntimeTagDictionary, getKnowledgePointsBySubject } from './types';
+import {
+  attachCanonicalKnowledgeNodeIds,
+  attachCanonicalKnowledgePointIds,
+  attachCanonicalQuestionIds,
+  matchesQuestionIdentifier,
+  resolveCanonicalMistakeId,
+  resolveCanonicalNodeId,
+  resolveCanonicalTagId,
+} from './entityIds';
 import { formatQuestionTextForStorage } from './questionPreview';
 import {
   buildNormalizedQuestionPayload,
@@ -30,8 +56,18 @@ import { normalizeQuestionTags } from './questionTagEngine';
 import { persistentCacheAdapter } from './cacheAdapter';
 import { queryClient } from './queryClient';
 import { queryKeys } from './queryKeys';
-import { dataAccessMode } from './config';
+import {
+  dataAccessMode,
+  reviewAiGrayPercent,
+  reviewAiPlannerEnabled,
+} from './config';
 import { localDataApiFetch } from './localDataApi';
+import {
+  buildReviewPlannerGraySeed,
+  buildReviewPlannerPlanVersion,
+  getReviewPlannerStrategyMeta,
+  resolveReviewPlannerRollout,
+} from './reviewPlannerStrategy';
 
 function getSupabaseConfig() {
   const env = (import.meta as any).env || {};
@@ -59,6 +95,10 @@ const globalScope = globalThis as typeof globalThis & {
   __vlearnSupabaseClient__?: SupabaseClientType;
 };
 
+const LOCAL_DEV_USER_ID = 'local-dev-user';
+const LOCAL_DEV_USER_EMAIL = 'local@example.com';
+const LOCAL_DEV_FALLBACK_ACCESS_TOKEN = 'eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJsb2NhbC1kZXYtdXNlciIsImVtYWlsIjoibG9jYWxAZXhhbXBsZS5jb20iLCJleHAiOjQxMDI0NDQ4MDB9.local';
+
 export const supabase: SupabaseClientType = globalScope.__vlearnSupabaseClient__ || createSupabaseClient();
 
 if (!globalScope.__vlearnSupabaseClient__) {
@@ -73,9 +113,17 @@ if (isLocalDataApiMode()) {
       return rawGetUser(jwt);
     }
     const sessionResult = await rawGetSession();
+    const sessionUser = sessionResult.data.session?.user;
     return {
       data: {
-        user: sessionResult.data.session?.user || null,
+        user: sessionUser || ({
+          id: LOCAL_DEV_USER_ID,
+          email: LOCAL_DEV_USER_EMAIL,
+          aud: 'authenticated',
+          app_metadata: {},
+          user_metadata: {},
+          created_at: new Date(0).toISOString(),
+        } as any),
       },
       error: null,
     } as Awaited<ReturnType<typeof rawGetUser>>;
@@ -96,11 +144,19 @@ function isLocalDataApiMode() {
 async function getAccessToken() {
   const sessionResult = await supabase.auth.getSession();
   const token = sessionResult.data.session?.access_token;
-  if (!token) throw new Error('未登录');
+  if (!token) {
+    if (isLocalDataApiMode()) return LOCAL_DEV_FALLBACK_ACCESS_TOKEN;
+    throw new Error('未登录');
+  }
   return token;
 }
 
+async function getAccessTokenOrLocalFallback() {
+  return getAccessToken().catch(() => LOCAL_DEV_FALLBACK_ACCESS_TOKEN);
+}
+
 function normalizeQuestionRow(row: any): Question {
+  const canonicalRow = attachCanonicalQuestionIds(row || {});
   const questionText = row?.question_text || row?.question || '未填写题目内容';
   const fallbackPayload = buildNormalizedQuestionPayload({
     questionText,
@@ -114,29 +170,177 @@ function normalizeQuestionRow(row: any): Question {
   const validationStatus = row?.validation_status || normalizeValidationStatus(validation.valid);
   const renderMode = row?.render_mode || deriveRenderMode(validationStatus);
   const canonicalTags = normalizeQuestionTags({
-    subject: row?.subject,
-    knowledgePoint: row?.knowledge_point,
-    ability: row?.ability,
-    errorType: row?.error_type,
+    subject: canonicalRow?.subject,
+    knowledgePoint: canonicalRow?.knowledge_point,
   });
-  const normalizedErrorType = canonicalTags.errorType;
   return {
-    ...row,
+    ...canonicalRow,
     subject: canonicalTags.subject,
     question_text: questionText,
     knowledge_point: canonicalTags.knowledgePoint,
-    ability: canonicalTags.ability,
+    ability: '',
     question_type: row?.question_type || normalizedPayload.questionType,
     normalized_payload: normalizedPayload,
     validation_status: validationStatus,
     render_mode: renderMode,
-    error_type: normalizedErrorType,
+    error_type: '',
     payload_version: row?.payload_version || normalizedPayload.version,
+    mastery_level: row?.mastery_level ?? Math.round((row?.confidence ?? 0.5) * 100),
+    stability: row?.stability == null ? undefined : Number(row.stability),
+    difficulty: row?.difficulty == null ? undefined : Number(row.difficulty),
+    last_interval_days: row?.last_interval_days == null ? undefined : Number(row.last_interval_days),
+    lapse_count: row?.lapse_count == null ? undefined : Number(row.lapse_count),
+    predicted_recall: row?.predicted_recall == null ? undefined : Number(row.predicted_recall),
+    priority_score: row?.priority_score == null ? undefined : Number(row.priority_score),
+    plan_source: row?.plan_source || 'rule_fallback',
   } as Question;
+}
+
+function normalizeKnowledgeNodeRow(row: any) {
+  return attachCanonicalKnowledgeNodeIds(row || {});
+}
+
+function normalizeKnowledgePointRow(row: any) {
+  return attachCanonicalKnowledgePointIds(row || {});
+}
+
+function normalizeTaxonomyWriteResult(payload: any) {
+  if (!payload || typeof payload !== 'object') return payload;
+  const knowledgePoint = payload.knowledge_point ? normalizeKnowledgePointRow(payload.knowledge_point) : payload.knowledge_point;
+  const nodeSeed = payload.node && typeof payload.node === 'object' ? payload.node : {};
+  return {
+    ...payload,
+    knowledge_point: knowledgePoint,
+    node: normalizeKnowledgeNodeRow({
+      ...nodeSeed,
+      tag_id: (nodeSeed as any)?.tag_id || knowledgePoint?.tag_id || payload?.tag?.tag_id,
+      node_id: (nodeSeed as any)?.node_id || knowledgePoint?.node_id || knowledgePoint?.kp_id,
+      knowledge_point_id: (nodeSeed as any)?.knowledge_point_id || knowledgePoint?.kp_id,
+      name: (nodeSeed as any)?.name || (nodeSeed as any)?.node || knowledgePoint?.name,
+    }),
+  };
+}
+
+async function resolveStoredQuestionRowId(identifier: string): Promise<string> {
+  const normalized = String(identifier || '').trim();
+  if (!normalized) return '';
+  const allQuestions = await questionsApi.getAll();
+  const matched = allQuestions.find((question) => matchesQuestionIdentifier(question, normalized));
+  return matched?.id || normalized;
 }
 
 function isQuestionArchived(item: Partial<Question> | null | undefined) {
   return Boolean(item?.is_archived || item?.mastery_state === 'archived');
+}
+
+const VALID_MASTERY_STATES: NonNullable<Question['mastery_state']>[] = ['active', 'mastered', 'archived'];
+let dictionaryHydrateInFlight: Promise<void> | null = null;
+
+function normalizeMasteryStateForInsert(state: Question['mastery_state'] | null | undefined): NonNullable<Question['mastery_state']> {
+  return VALID_MASTERY_STATES.includes(state as NonNullable<Question['mastery_state']>) ? (state as NonNullable<Question['mastery_state']>) : 'active';
+}
+
+function ensureNonEmptyTagDictionary() {
+  applyRuntimeTagDictionary({
+    knowledgePointBySubject: {
+      英语: getKnowledgePointsBySubject('英语'),
+      C语言: getKnowledgePointsBySubject('C语言'),
+    },
+    errorTypeBySubject: {
+      英语: [],
+      C语言: [],
+    },
+    abilities: [],
+  });
+}
+
+function hydrateTagDictionaryFromPayload(payload: any) {
+  const bySubject = payload?.dictionary?.by_subject || {};
+  const knowledge = bySubject?.knowledge_point || {};
+  applyRuntimeTagDictionary({
+    knowledgePointBySubject: {
+      英语: Array.isArray(knowledge?.英语) ? knowledge.英语 : [],
+      C语言: Array.isArray(knowledge?.C语言) ? knowledge.C语言 : [],
+    },
+    errorTypeBySubject: {
+      英语: [],
+      C语言: [],
+    },
+    abilities: [],
+  });
+  ensureNonEmptyTagDictionary();
+}
+
+async function hydrateTagDictionaryOnce(force = false) {
+  if (!force && getKnowledgePointsBySubject('英语').length > 0 && getKnowledgePointsBySubject('C语言').length > 0) {
+    return;
+  }
+  if (!dictionaryHydrateInFlight) {
+    dictionaryHydrateInFlight = (async () => {
+      try {
+        if (isLocalDataApiMode()) {
+          const token = await getAccessToken();
+          const response = await localDataApiFetch<{ data: any }>(token, '/tag-dictionary');
+          hydrateTagDictionaryFromPayload(response.data || {});
+          return;
+        }
+        const [catalogResult, itemsResult] = await Promise.all([
+          supabase.from('tag_catalog').select('tag_id,subject,tag_name,category,branch,code').order('tag_id', { ascending: true }),
+          supabase.from('tag_dictionary_items').select('item_type,subject,label,sort_order').order('sort_order', { ascending: true }),
+        ]);
+        if (catalogResult.error || itemsResult.error) {
+          throw new Error(catalogResult.error?.message || itemsResult.error?.message || '标签字典读取失败');
+        }
+        const grouped: Record<string, Record<string, string[]>> = {
+          knowledge_point: {},
+          error_type: {},
+          ability: {},
+        };
+        const all: Record<string, string[]> = {
+          knowledge_point: [],
+          error_type: [],
+          ability: [],
+        };
+        for (const row of itemsResult.data || []) {
+          const type = String(row.item_type || '').trim();
+          if (!(type in grouped)) continue;
+          const label = String(row.label || '').trim();
+          if (!label) continue;
+          const subject = String(row.subject || '').trim();
+          all[type].push(label);
+          if (subject) {
+            if (!grouped[type][subject]) grouped[type][subject] = [];
+            grouped[type][subject].push(label);
+          }
+        }
+        hydrateTagDictionaryFromPayload({
+          tags: catalogResult.data || [],
+          dictionary: {
+            by_subject: grouped,
+            all,
+          },
+        });
+      } catch {
+        ensureNonEmptyTagDictionary();
+      }
+    })().finally(() => {
+      dictionaryHydrateInFlight = null;
+    });
+  }
+  await dictionaryHydrateInFlight;
+}
+
+function sanitizeMasteryStateForUpdate(payload: Partial<Question>): Partial<Question> {
+  if (!Object.prototype.hasOwnProperty.call(payload, 'mastery_state')) {
+    return payload;
+  }
+  const state = payload.mastery_state;
+  if (VALID_MASTERY_STATES.includes(state as NonNullable<Question['mastery_state']>)) {
+    return payload;
+  }
+  const next = { ...payload };
+  delete next.mastery_state;
+  return next;
 }
 
 function normalizeQuestionPayload(payload: Partial<Question> & { options?: string[] }) {
@@ -152,8 +356,6 @@ function normalizeQuestionPayload(payload: Partial<Question> & { options?: strin
   const canonicalTags = normalizeQuestionTags({
     subject: payload.subject,
     knowledgePoint: payload.knowledge_point,
-    ability: payload.ability,
-    errorType: payload.error_type,
   });
   const questionText = formatQuestionTextForStorage(
     stem,
@@ -162,21 +364,520 @@ function normalizeQuestionPayload(payload: Partial<Question> & { options?: strin
       : [],
   );
   const validationStatus = normalizeValidationStatus(validation.valid);
-  const normalizedErrorType = canonicalTags.errorType;
   return {
     ...payload,
     subject: canonicalTags.subject,
     question_text: questionText,
     knowledge_point: canonicalTags.knowledgePoint,
-    ability: canonicalTags.ability,
+    ability: '',
     question_type: normalizedPayload.questionType,
     raw_ai_response: payload.raw_ai_response || payload.question_text || questionText,
     normalized_payload: normalizedPayload,
     payload_version: normalizedPayload.version,
     validation_status: validationStatus,
     render_mode: deriveRenderMode(validationStatus),
-    error_type: normalizedErrorType,
+    error_type: '',
   };
+}
+
+const REVIEW_PLANNER_TIMEOUT_MS = 5000;
+const REVIEW_PLANNER_MAX_RETRIES = 2;
+const REVIEW_PLANNER_STRATEGIES = ['rescue', 'reinforce', 'new', 'revisit'] as const;
+
+function clampNumber(value: unknown, fallback: number, min: number, max: number) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.min(max, Math.max(min, numeric));
+}
+
+function hashTextToBucket(input: string) {
+  let hash = 0;
+  for (let index = 0; index < input.length; index += 1) {
+    hash = ((hash << 5) - hash + input.charCodeAt(index)) | 0;
+  }
+  return Math.abs(hash % 100);
+}
+
+function buildPlannerInputPayload(userId: string, input: ReviewPlannerRunInput): PlannerInputPayload {
+  return {
+    request_id: crypto.randomUUID(),
+    request_at: new Date().toISOString(),
+    user: {
+      user_id: userId,
+      stats_7d: { review_count: 0, accuracy: 0, interruption_rate: 0 },
+      stats_30d: { review_count: 0, accuracy: 0, interruption_rate: 0 },
+      subject_preference: [input.subject],
+    },
+    session_constraints: {
+      budget_count: Math.max(1, input.budget_count),
+      prefer_due: input.scope === 'due',
+      subjects: [input.subject],
+    },
+    system_constraints: {
+      min_interval_days: 1,
+      max_session_count: 5,
+      due_min_ratio: input.due_min_ratio,
+      archived_excluded: true,
+    },
+    questions: input.rule_queue.map((question) => ({
+      question_id: question.id,
+      subject: question.subject as Subject,
+      knowledge_point: question.knowledge_point,
+      mastery_state: question.mastery_state || 'active',
+      review_count: question.review_count || 0,
+      last_result: 'unknown',
+      last_interval_days: question.last_interval_days || 0,
+      lapse_count: question.lapse_count || 0,
+      stability: question.stability || 0,
+      difficulty: question.difficulty || 0.5,
+      predicted_recall: question.predicted_recall || 0,
+      is_due: !!question.next_review_date && new Date(question.next_review_date) <= new Date(),
+      is_archived: !!question.is_archived,
+    })),
+  };
+}
+
+function buildRuleQueueSnapshot(queue: Question[]): PlannerQueueItem[] {
+  return queue.map((item, index) => ({
+    question_id: item.id,
+    rank: index + 1,
+    reason: item.plan_source === 'ai' ? 'AI 计划' : '规则候选顺序',
+    suggested_interval_days: Math.max(1, Math.round(item.last_interval_days || 1)),
+    priority_score: clampNumber(item.priority_score, Math.max(1, 100 - index), 0, 100),
+    strategy: item.next_review_date && new Date(item.next_review_date) <= new Date() ? 'rescue' : 'reinforce',
+  }));
+}
+
+function buildPlannerPrompt(payload: PlannerInputPayload, template: ReturnType<typeof getReviewPlannerStrategyMeta>) {
+  return `你是复习计划 AI Planner。请只基于给定候选集重排题目，不得输出候选集之外的 question_id。
+
+策略模板：${template.strategy_template}
+策略标签：${template.strategy_label}
+策略说明：${template.prompt_hint}
+权重画像：${JSON.stringify(template.weighting_profile)}
+
+请输出严格 JSON，不要输出 markdown，不要输出解释文字。
+输出格式：
+{
+  "request_id": "${payload.request_id}",
+  "plan_version": "${buildReviewPlannerPlanVersion(template.strategy_template)}",
+  "queue": [
+    {
+      "question_id": "候选集中的ID",
+      "rank": 1,
+      "reason": "一句中文原因",
+      "suggested_interval_days": 1,
+      "priority_score": 0-100数字,
+      "strategy": "rescue|reinforce|new|revisit"
+    }
+  ],
+  "mix": {
+    "rescue": 0-1数字,
+    "reinforce": 0-1数字,
+    "new": 0-1数字,
+    "revisit": 0-1数字
+  },
+  "risk": {
+    "high_volatility": true,
+    "high_fatigue": false,
+    "missing_data": false,
+    "notes": ["中文风险说明"]
+  },
+  "confidence": 0-1数字
+}
+
+约束：
+1. queue 最多 ${payload.session_constraints.budget_count} 题。
+2. 题目必须来自候选集 questions。
+3. 优先满足 due 覆盖与高遗忘风险。
+4. reason 必须简洁可解释。
+
+输入：
+${JSON.stringify(payload)}`;
+}
+
+function extractPlannerJson(content: string) {
+  const plain = String(content || '').replace(/```json|```/gi, '').trim();
+  const match = plain.match(/\{[\s\S]*\}/);
+  if (!match) {
+    throw new Error('planner_json_missing');
+  }
+  return JSON.parse(match[0]);
+}
+
+function inferPlannerStrategy(question: PlannerInputPayload['questions'][number], priorityScore: number): PlannerQueueItem['strategy'] {
+  if (question.is_due) return 'rescue';
+  if (question.review_count === 0) return 'new';
+  if (question.lapse_count >= 2 || question.predicted_recall < 0.35 || priorityScore >= 80) return 'revisit';
+  return 'reinforce';
+}
+
+function generateHeuristicPlannerOutput(
+  payload: PlannerInputPayload,
+  planVersion: string,
+  template: ReturnType<typeof getReviewPlannerStrategyMeta>,
+): PlannerOutputPayload {
+  const ranked = [...payload.questions]
+    .map((question) => {
+      const urgencyScore = (question.is_due ? template.weighting_profile.due : 0)
+        + (1 - clampNumber(question.predicted_recall, 0.5, 0, 1)) * template.weighting_profile.recall
+        + clampNumber(question.lapse_count, 0, 0, 10) * template.weighting_profile.lapse
+        + (1 - clampNumber(question.stability, 0.5, 0, 1)) * template.weighting_profile.stability
+        + clampNumber(question.difficulty, 0.5, 0, 1) * template.weighting_profile.difficulty
+        + (question.review_count === 0 ? template.weighting_profile.new_question : 0);
+      const priorityScore = Math.round(Math.min(100, urgencyScore));
+      const strategy = inferPlannerStrategy(question, priorityScore);
+      const reason = question.is_due
+        ? '到期题优先抢救，避免遗忘继续扩大'
+        : strategy === 'revisit'
+          ? '近期波动较大，建议优先回访巩固'
+          : strategy === 'new'
+            ? '新题首次进入计划，安排轻量试探'
+            : '当前适合继续巩固，保持节奏';
+      return {
+        question,
+        priorityScore,
+        strategy,
+        reason,
+      };
+    })
+    .sort((left, right) => {
+      if (right.priorityScore !== left.priorityScore) return right.priorityScore - left.priorityScore;
+      return left.question.question_id.localeCompare(right.question.question_id, 'zh-CN');
+    })
+    .slice(0, Math.max(1, payload.session_constraints.budget_count));
+
+  const total = ranked.length || 1;
+  const mixCounter = {
+    rescue: 0,
+    reinforce: 0,
+    new: 0,
+    revisit: 0,
+  };
+  const queue = ranked.map((item, index) => {
+    mixCounter[item.strategy] += 1;
+    return {
+      question_id: item.question.question_id,
+      rank: index + 1,
+      reason: item.reason,
+      suggested_interval_days: item.question.is_due ? 1 : Math.max(1, Math.round((1 - item.question.predicted_recall) * 4)),
+      priority_score: item.priorityScore,
+      strategy: item.strategy,
+    };
+  });
+  return {
+    request_id: payload.request_id,
+    plan_version: planVersion,
+    queue,
+    mix: {
+      rescue: Number((mixCounter.rescue / total).toFixed(3)),
+      reinforce: Number((mixCounter.reinforce / total).toFixed(3)),
+      new: Number((mixCounter.new / total).toFixed(3)),
+      revisit: Number((mixCounter.revisit / total).toFixed(3)),
+    },
+    risk: {
+      high_volatility: ranked.some((item) => item.question.lapse_count >= 2),
+      high_fatigue: ranked.filter((item) => item.question.difficulty >= 0.75).length >= Math.max(3, Math.floor(total * 0.6)),
+      missing_data: payload.questions.some((item) => item.predicted_recall === 0 && item.stability === 0),
+      notes: ['未配置外部模型时使用本地启发式重排'],
+    },
+    confidence: 0.68,
+  };
+}
+
+function normalizePlannerOutput(raw: any, payload: PlannerInputPayload, planVersion: string): PlannerOutputPayload {
+  const queue = Array.isArray(raw?.queue) ? raw.queue : [];
+  if (!queue.length) {
+    throw new Error('planner_queue_empty');
+  }
+  return {
+    request_id: String(raw?.request_id || payload.request_id || '').trim() || payload.request_id,
+    plan_version: String(raw?.plan_version || '').trim() || planVersion,
+    queue: queue.map((item: any, index: number) => ({
+      question_id: String(item?.question_id || '').trim(),
+      rank: Math.max(1, Math.round(clampNumber(item?.rank, index + 1, 1, 999))),
+      reason: String(item?.reason || '').trim() || 'AI 未提供理由，已按候选特征兜底',
+      suggested_interval_days: Math.max(1, Math.round(clampNumber(item?.suggested_interval_days, 1, 1, 365))),
+      priority_score: clampNumber(item?.priority_score, 50, 0, 100),
+      strategy: REVIEW_PLANNER_STRATEGIES.includes(item?.strategy) ? item.strategy : 'reinforce',
+    })),
+    mix: {
+      rescue: clampNumber(raw?.mix?.rescue, 0, 0, 1),
+      reinforce: clampNumber(raw?.mix?.reinforce, 0, 0, 1),
+      new: clampNumber(raw?.mix?.new, 0, 0, 1),
+      revisit: clampNumber(raw?.mix?.revisit, 0, 0, 1),
+    },
+    risk: {
+      high_volatility: Boolean(raw?.risk?.high_volatility),
+      high_fatigue: Boolean(raw?.risk?.high_fatigue),
+      missing_data: Boolean(raw?.risk?.missing_data),
+      notes: Array.isArray(raw?.risk?.notes) ? raw.risk.notes.map((item: unknown) => String(item || '').trim()).filter(Boolean) : [],
+    },
+    confidence: clampNumber(raw?.confidence, 0.65, 0, 1),
+  };
+}
+
+function summarizePlannerComparison(ruleQueue: Question[], aiQueue: PlannerQueueItem[] | undefined, executionQueue: Question[], notes: string[]) {
+  const ruleIds = new Set(ruleQueue.map((item) => item.id));
+  const aiIds = new Set((aiQueue || []).map((item) => item.question_id).filter(Boolean));
+  const executionIds = new Set(executionQueue.map((item) => item.id));
+  const aiOverlap = [...ruleIds].filter((item) => aiIds.has(item)).length;
+  const finalOverlap = [...ruleIds].filter((item) => executionIds.has(item)).length;
+  const executionDueCount = executionQueue.filter((item) => !!item.next_review_date && new Date(item.next_review_date) <= new Date()).length;
+  return {
+    rule_count: ruleIds.size,
+    ai_count: aiIds.size,
+    execution_count: executionIds.size,
+    ai_rule_overlap_count: aiOverlap,
+    execution_rule_overlap_count: finalOverlap,
+    execution_due_count: executionDueCount,
+    execution_due_ratio: executionIds.size > 0 ? Number((executionDueCount / executionIds.size).toFixed(3)) : 0,
+    guardrail_notes: notes,
+  };
+}
+
+function applyPlannerGuardrails(input: {
+  payload: PlannerInputPayload;
+  ruleQueue: Question[];
+  plannerOutput: PlannerOutputPayload;
+  strategyTemplate: string;
+  strategyLabel: string;
+  planningLatencyMs: number;
+  rolloutMetadata: ReviewPlannerRunResult['rollout_metadata'];
+}): ReviewPlannerRunResult {
+  const { payload, ruleQueue, plannerOutput, strategyTemplate, strategyLabel, planningLatencyMs, rolloutMetadata } = input;
+  const budget = Math.max(1, payload.session_constraints.budget_count);
+  const candidateMap = new Map(payload.questions.map((item) => [item.question_id, item] as const));
+  const ruleMap = new Map(ruleQueue.map((item) => [item.id, item] as const));
+  const notes: string[] = [];
+  const normalizedQueue: PlannerQueueItem[] = [];
+  const pickedIds = new Set<string>();
+  const dueCandidateIds = payload.questions.filter((item) => item.is_due).map((item) => item.question_id);
+  const requiredDueCount = dueCandidateIds.length > 0
+    ? Math.min(budget, Math.ceil(budget * payload.system_constraints.due_min_ratio), dueCandidateIds.length)
+    : 0;
+
+  for (const item of plannerOutput.queue) {
+    const questionId = String(item.question_id || '').trim();
+    if (!questionId) continue;
+    const candidate = candidateMap.get(questionId);
+    const questionRow = ruleMap.get(questionId);
+    if (!candidate || !questionRow) {
+      notes.push(`removed_invalid_candidate:${questionId}`);
+      continue;
+    }
+    if (pickedIds.has(questionId)) {
+      notes.push(`removed_duplicate:${questionId}`);
+      continue;
+    }
+    if (payload.system_constraints.archived_excluded && (candidate.is_archived || questionRow.is_archived || questionRow.mastery_state === 'archived')) {
+      notes.push(`removed_archived:${questionId}`);
+      continue;
+    }
+    if (!candidate.is_due && candidate.last_interval_days > 0 && candidate.last_interval_days < payload.system_constraints.min_interval_days) {
+      notes.push(`removed_min_interval:${questionId}`);
+      continue;
+    }
+    pickedIds.add(questionId);
+    normalizedQueue.push({
+      ...item,
+      question_id: questionId,
+      rank: normalizedQueue.length + 1,
+      suggested_interval_days: Math.max(payload.system_constraints.min_interval_days, item.suggested_interval_days || 1),
+      priority_score: clampNumber(item.priority_score, 50, 0, 100),
+      strategy: item.strategy || inferPlannerStrategy(candidate, clampNumber(item.priority_score, 50, 0, 100)),
+    });
+    if (normalizedQueue.length >= budget) break;
+  }
+
+  const appendRuleQuestion = (question: Question, reason: string) => {
+    if (pickedIds.has(question.id) || question.is_archived || question.mastery_state === 'archived') return false;
+    pickedIds.add(question.id);
+    normalizedQueue.push({
+      question_id: question.id,
+      rank: normalizedQueue.length + 1,
+      reason,
+      suggested_interval_days: Math.max(payload.system_constraints.min_interval_days, Math.round(question.last_interval_days || 1)),
+      priority_score: clampNumber(question.priority_score, 50, 0, 100),
+      strategy: !!question.next_review_date && new Date(question.next_review_date) <= new Date() ? 'rescue' : 'reinforce',
+    });
+    return true;
+  };
+
+  if (normalizedQueue.length < budget) {
+    for (const question of ruleQueue) {
+      if (normalizedQueue.length >= budget) break;
+      if (appendRuleQuestion(question, '规则补齐预算缺口')) {
+        notes.push(`filled_budget:${question.id}`);
+      }
+    }
+  }
+
+  const countDue = () => normalizedQueue.filter((item) => candidateMap.get(item.question_id)?.is_due).length;
+  let dueCount = countDue();
+  if (dueCount < requiredDueCount) {
+    for (const question of ruleQueue) {
+      if (dueCount >= requiredDueCount) break;
+      const candidate = candidateMap.get(question.id);
+      if (!candidate?.is_due || pickedIds.has(question.id)) continue;
+      const replaceIndex = normalizedQueue.findIndex((item) => !candidateMap.get(item.question_id)?.is_due);
+      if (replaceIndex >= 0) {
+        const removed = normalizedQueue.splice(replaceIndex, 1)[0];
+        if (removed) pickedIds.delete(removed.question_id);
+      }
+      if (appendRuleQuestion(question, '规则补齐 due 覆盖')) {
+        notes.push(`filled_due:${question.id}`);
+        dueCount = countDue();
+      }
+    }
+  }
+
+  const executionQueue = normalizedQueue
+    .slice(0, budget)
+    .map((item) => ruleMap.get(item.question_id))
+    .filter((item): item is Question => Boolean(item));
+  const finalDueCount = executionQueue.filter((item) => !!item.next_review_date && new Date(item.next_review_date) <= new Date()).length;
+  const finalDueRatio = executionQueue.length > 0 ? finalDueCount / executionQueue.length : 0;
+
+  if (!executionQueue.length) {
+    return {
+      request_id: payload.request_id,
+      plan_source: 'rule_fallback',
+      plan_version: `${plannerOutput.plan_version}-fallback`,
+      fallback_reason: 'guardrail_unrecoverable',
+      planning_latency_ms: planningLatencyMs,
+      strategy_template: strategyTemplate,
+      strategy_label: strategyLabel,
+      execution_queue: ruleQueue.slice(0, budget),
+      rule_queue: ruleQueue.slice(0, budget),
+      ai_queue: plannerOutput.queue,
+      reasons: ['护栏修复后无可执行题目，已切回规则队列'],
+      confidence: plannerOutput.confidence,
+      comparison_summary: summarizePlannerComparison(ruleQueue.slice(0, budget), plannerOutput.queue, ruleQueue.slice(0, budget), [...notes, 'fallback:guardrail_unrecoverable']),
+      risk_flags: {
+        ...plannerOutput.risk,
+        strategy_template: strategyTemplate,
+        strategy_label: strategyLabel,
+      },
+      rollout_metadata: rolloutMetadata,
+    };
+  }
+
+  if (requiredDueCount > 0 && finalDueRatio < payload.system_constraints.due_min_ratio) {
+    return {
+      request_id: payload.request_id,
+      plan_source: 'rule_fallback',
+      plan_version: `${plannerOutput.plan_version}-fallback`,
+      fallback_reason: 'due_min_ratio_unmet',
+      planning_latency_ms: planningLatencyMs,
+      strategy_template: strategyTemplate,
+      strategy_label: strategyLabel,
+      execution_queue: ruleQueue.slice(0, budget),
+      rule_queue: ruleQueue.slice(0, budget),
+      ai_queue: plannerOutput.queue,
+      reasons: ['AI 计划未满足 due 覆盖护栏，已切回规则队列'],
+      confidence: plannerOutput.confidence,
+      comparison_summary: summarizePlannerComparison(ruleQueue.slice(0, budget), plannerOutput.queue, ruleQueue.slice(0, budget), [...notes, 'fallback:due_min_ratio_unmet']),
+      risk_flags: {
+        ...plannerOutput.risk,
+        strategy_template: strategyTemplate,
+        strategy_label: strategyLabel,
+      },
+      rollout_metadata: rolloutMetadata,
+    };
+  }
+
+  const reasons = normalizedQueue.slice(0, 3).map((item) => item.reason).filter(Boolean);
+  return {
+    request_id: payload.request_id,
+    plan_source: 'ai',
+    plan_version: plannerOutput.plan_version,
+    planning_latency_ms: planningLatencyMs,
+    strategy_template: strategyTemplate,
+    strategy_label: strategyLabel,
+    execution_queue: executionQueue,
+    rule_queue: ruleQueue.slice(0, budget),
+    ai_queue: normalizedQueue.slice(0, budget),
+    reasons: reasons.length ? reasons : ['AI 已重排本次复习顺序'],
+    confidence: plannerOutput.confidence,
+    comparison_summary: summarizePlannerComparison(ruleQueue.slice(0, budget), normalizedQueue.slice(0, budget), executionQueue, notes),
+    risk_flags: {
+      ...plannerOutput.risk,
+      strategy_template: strategyTemplate,
+      strategy_label: strategyLabel,
+    },
+    rollout_metadata: rolloutMetadata,
+  };
+}
+
+async function persistPlannerTelemetry(userId: string, payload: PlannerInputPayload, result: ReviewPlannerRunResult) {
+  const insertPayload = {
+    user_id: userId,
+    request_id: result.request_id,
+    plan_source: result.plan_source,
+    plan_version: result.plan_version,
+    fallback_reason: result.fallback_reason || null,
+    schema_validation_passed: result.plan_source === 'ai',
+    planning_latency_ms: result.planning_latency_ms,
+    request_summary: {
+      subject: payload.session_constraints.subjects[0] || null,
+      budget_count: payload.session_constraints.budget_count,
+      prefer_due: payload.session_constraints.prefer_due,
+      strategy_template: result.strategy_template,
+      strategy_label: result.strategy_label,
+      rollout: result.rollout_metadata || null,
+    },
+    rule_queue_snapshot: buildRuleQueueSnapshot(result.rule_queue),
+    shadow_queue_snapshot: result.ai_queue || null,
+    comparison_summary: result.comparison_summary || null,
+    risk_flags: result.risk_flags || null,
+  };
+  await supabase.from('review_plan_telemetry').insert(insertPayload as never).throwOnError().catch((error) => {
+    if (String(error?.message || '').includes('relation "review_plan_telemetry" does not exist')) {
+      return;
+    }
+    console.warn('Failed to insert review_plan_telemetry:', error?.message || error);
+  });
+}
+
+async function requestLivePlannerOutput(input: {
+  payload: PlannerInputPayload;
+  strategyMeta: ReturnType<typeof getReviewPlannerStrategyMeta>;
+  signal: AbortSignal;
+}) {
+  const env = (import.meta as any).env || {};
+  const apiKey = String(env.VITE_DASHSCOPE_API_KEY || env.NEXT_PUBLIC_DASHSCOPE_API_KEY || '').trim();
+  const planVersion = buildReviewPlannerPlanVersion(input.strategyMeta.strategy_template);
+  if (!apiKey) {
+    return generateHeuristicPlannerOutput(input.payload, planVersion, input.strategyMeta);
+  }
+  const response = await fetch(getAiProxyUrl(), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: env.VITE_QWEN_MODEL || env.NEXT_PUBLIC_QWEN_MODEL || 'qwen3.5-plus',
+      stream: false,
+      messages: [
+        {
+          role: 'system',
+          content: buildPlannerPrompt(input.payload, input.strategyMeta),
+        },
+      ],
+    }),
+    signal: input.signal,
+  });
+  if (!response.ok) {
+    throw new Error(`planner_http_${response.status}`);
+  }
+  const body = await response.json();
+  const content = String(body?.choices?.[0]?.message?.content || '').trim();
+  if (!content) {
+    throw new Error('planner_empty_content');
+  }
+  return normalizePlannerOutput(extractPlannerJson(content), input.payload, planVersion);
 }
 
 // Levenshtein distance for fuzzy matching
@@ -202,28 +903,22 @@ function getEditDistance(a: string, b: string): number {
 async function normalizeQuestionTagsForWrite(input: {
   subject?: string;
   knowledgePoint?: string;
-  ability?: string;
-  errorType?: string;
 }) {
+  await hydrateTagDictionaryOnce();
   const baseTags = normalizeQuestionTags(input);
   
   // Get custom tags from learning state
   let customKnowledgePoints: string[] = [];
-  let customErrorTypes: string[] = [];
   try {
     const state = await userLearningStateApi.get();
     customKnowledgePoints = state.tag_extensions?.knowledge_point || [];
-    customErrorTypes = state.tag_extensions?.error_type || [];
   } catch (err) {
     // Ignore error, fallback to base
   }
 
   const subject = baseTags.subject;
   const allKps = [...(subject === '英语' ? getKnowledgePointsBySubject('英语') : getKnowledgePointsBySubject('C语言')), ...customKnowledgePoints];
-  const allErrors = [...getErrorTypesBySubject(subject), ...customErrorTypes];
-
   let finalKp = input.knowledgePoint ? input.knowledgePoint.trim() : baseTags.knowledgePoint;
-  let finalError = input.errorType ? input.errorType.trim() : baseTags.errorType;
 
   // Fuzzy match knowledge point if not exactly in list
   if (finalKp && !allKps.includes(finalKp)) {
@@ -242,40 +937,18 @@ async function normalizeQuestionTagsForWrite(input: {
     }
     finalKp = bestMatch;
   }
-  // If still not in list, but we have a custom tag, we might want to just keep it or fallback
-  // Actually, to avoid losing user's intended tag, we keep it. If it's totally new, it's treated as custom.
-  // But wait, user said "不会乱搞...存入对应知识点", so we should strictly map it to an existing tag if possible, otherwise fallback to baseTags.knowledgePoint.
+  if (!finalKp) {
+    throw new Error('缺少知识点标签，无法写入错题。请先选择或创建知识点。');
+  }
   if (!allKps.includes(finalKp)) {
-    finalKp = baseTags.knowledgePoint;
+    throw new Error(`知识点「${finalKp}」尚未创建，无法写入错题。请先显式创建标签或改为现有标签。`);
   }
 
-  // Fuzzy match error type
-  if (finalError && !allErrors.includes(finalError)) {
-    let bestMatch = finalError;
-    let minDistance = Infinity;
-    for (const et of allErrors) {
-      if (et.includes(finalError) || finalError.includes(et)) {
-        bestMatch = et;
-        break;
-      }
-      const dist = getEditDistance(finalError, et);
-      if (dist <= 2 && dist < minDistance) {
-        minDistance = dist;
-        bestMatch = et;
-      }
-    }
-    finalError = bestMatch;
-  }
-  if (!allErrors.includes(finalError)) {
-    finalError = baseTags.errorType;
-  }
-
-  // Bypass RPC to avoid it destroying custom tags
   return {
     subject,
     knowledgePoint: finalKp,
-    ability: baseTags.ability,
-    errorType: finalError,
+    ability: '',
+    errorType: '',
   };
 }
 
@@ -353,6 +1026,7 @@ const questionsCache = new Map<string, CacheEntry<Question[]>>();
 const weaknessCache = new Map<string, CacheEntry<UserWeakness[]>>();
 const statsCache = new Map<string, CacheEntry<Stats>>();
 const learningStateCache = new Map<string, CacheEntry<UserLearningStateRecord>>();
+const generationCache = new Map<string, CacheEntry<GovernedGenerationResult>>();
 let learningStateInFlight: Promise<UserLearningStateRecord> | null = null;
 
 function isClient() {
@@ -506,6 +1180,172 @@ function shouldKeepGeneratedQuestion(item: VariantQuestion, subject: Subject) {
   return true;
 }
 
+function getGenerationCacheKey(input: GovernedGenerationRequest) {
+  return [
+    input.subject,
+    input.strategy,
+    input.objectiveCode,
+    input.amount,
+    input.nodes.map((item) => item.trim()).filter(Boolean).sort().join('|'),
+    input.generationPolicy.allowAiGenerate ? 'ai' : 'no-ai',
+    input.generationPolicy.allowCache ? 'cache' : 'no-cache',
+    input.generationPolicy.allowRuleFallback ? 'rule' : 'no-rule',
+  ].join('::');
+}
+
+function getWritebackLedgerKey(idempotencyKey: string) {
+  return `aiweb_learning_writeback_v1:${idempotencyKey}`;
+}
+
+function readWritebackLedger<T>(idempotencyKey?: string): T | null {
+  if (!idempotencyKey) return null;
+  return readCacheFromStorage<T>(getWritebackLedgerKey(idempotencyKey))?.value || null;
+}
+
+function writeWritebackLedger<T>(idempotencyKey: string | undefined, value: T) {
+  if (!idempotencyKey) return;
+  writeCacheToStorage(getWritebackLedgerKey(idempotencyKey), {
+    value,
+    timestamp: Date.now(),
+  });
+}
+
+function buildGenerationPrompt(input: GovernedGenerationRequest, amount: number) {
+  const templateHint = input.subject === '英语'
+    ? '优先生成单选或短填空，阅读题必须提供完整语篇。'
+    : '优先生成代码理解、程序输出或语法判断题，保证题干自洽。';
+  return `请作为专业教师，针对${input.subject}学科生成 ${amount} 道变式训练题。
+${input.nodes.length > 0 ? `考察的知识点为：${input.nodes.join('、')}。` : ''}
+本轮学习目标：${input.explanationSummary || input.sourceReason || input.successCriteria}
+出题策略要求为：【${input.strategy}】。
+治理要求：
+1. 题目必须完整且可判定。
+2. 选择题至少 4 个可区分选项，答案必须唯一。
+3. ${templateHint}
+4. 返回格式必须是纯 JSON 数组，不要输出 Markdown。
+JSON 格式如下：
+[
+  {
+    "level": 1,
+    "question_type": "choice",
+    "question_text": "完整题目",
+    "options": ["A. 选项1", "B. 选项2", "C. 选项3", "D. 选项4"],
+    "correct_answer": "A",
+    "explanation": "详细解析"
+  }
+]`;
+}
+
+function normalizeGeneratedVariants(rawList: any[], subject: Subject, sourceKind: VariantQuestion['source_kind']): VariantQuestion[] {
+  return rawList.map((entry: any, idx: number) => {
+    const item = entry && typeof entry === 'object' ? entry as Record<string, any> : {};
+    const options = (Array.isArray(item.options) ? item.options : [])
+      .map((rawOption: any, optionIdx: number) => {
+        if (typeof rawOption === 'string') return rawOption.trim();
+        if (rawOption && typeof rawOption === 'object') {
+          const optionRecord = rawOption as Record<string, unknown>;
+          const textValue = typeof optionRecord.text === 'string' ? optionRecord.text.trim() : '';
+          if (textValue) {
+            const rawLabel = typeof optionRecord.label === 'string' ? optionRecord.label : '';
+            const label = rawLabel.match(/[A-H]/i)?.[0]?.toUpperCase() || String.fromCharCode(65 + optionIdx);
+            return `${label}. ${textValue}`;
+          }
+          const pair = Object.entries(optionRecord).find(([, value]) => typeof value === 'string' && String(value).trim().length > 0);
+          if (pair) {
+            const [key, value] = pair;
+            const label = key.match(/[A-H]/i)?.[0]?.toUpperCase() || String.fromCharCode(65 + optionIdx);
+            return `${label}. ${String(value).trim()}`;
+          }
+        }
+        return String(rawOption ?? '').trim();
+      })
+      .filter((value: string) => value.length > 0)
+      .map((value: string, optionIdx: number) => {
+        const label = String.fromCharCode(65 + optionIdx);
+        const text = value.replace(/^[A-H][\.．、:：\)）\]]\s*/i, '').trim();
+        return `${label}. ${text || value}`;
+      });
+    const rawType = item.question_type === 'choice' || item.question_type === 'fill'
+      ? item.question_type
+      : (item.questionType === 'choice' || item.questionType === 'fill' ? item.questionType : 'fill');
+    const question_type = rawType === 'choice' && options.length < 2 ? 'fill' : rawType;
+    const variant: VariantQuestion = {
+      level: Number(item.level) > 0 ? Number(item.level) : (idx + 1),
+      question_type,
+      question_text: String(item.question_text || item.question || '题目加载失败'),
+      options: question_type === 'choice' ? options : [],
+      correct_answer: String(item.correct_answer || item.correctAnswer || ''),
+      acceptable_answers: [],
+      explanation: String(item.explanation || item.analysis || '暂无解析'),
+      source_kind: sourceKind,
+      source_label: sourceKind === 'cache' ? '缓存复用' : sourceKind === 'rule_fallback' ? '规则模板' : 'AI 生成',
+      validation_status: 'accepted',
+    };
+    return variant;
+  }).filter((item) => item.question_text.trim().length > 0 && shouldKeepGeneratedQuestion(item, subject));
+}
+
+function buildRuleFallbackVariants(input: GovernedGenerationRequest, amount: number): VariantQuestion[] {
+  const nodes = input.nodes.length > 0 ? input.nodes : [input.subject === '英语' ? '核心知识点' : '基础语法'];
+  return Array.from({ length: Math.max(1, amount) }, (_, index) => {
+    const node = nodes[index % nodes.length];
+    if (input.subject === '英语') {
+      return {
+        level: Math.min(5, index + 1),
+        question_type: 'choice',
+        question_text: `请判断关于「${node}」的句子哪一项更符合本轮训练目标。\nA. 只关注表面词汇\nB. 结合语境与语法线索判断\nC. 完全忽略题干\nD. 只看选项长度`,
+        options: [
+          'A. 只关注表面词汇',
+          'B. 结合语境与语法线索判断',
+          'C. 完全忽略题干',
+          'D. 只看选项长度',
+        ],
+        correct_answer: 'B',
+        acceptable_answers: [],
+        explanation: `本题用于稳定覆盖 ${node} 的基础判断流程，帮助你先进入练习状态。`,
+        source_kind: 'rule_fallback',
+        source_label: '规则模板',
+        validation_status: 'accepted',
+      } as VariantQuestion;
+    }
+    return {
+      level: Math.min(5, index + 1),
+      question_type: 'fill',
+      question_text: `围绕「${node}」回答：写出一个判断程序输出或语法是否合法时必须先检查的关键点。`,
+      options: [],
+      correct_answer: '输入输出约束与语法条件',
+      acceptable_answers: ['语法条件与边界', '边界条件和语法约束'],
+      explanation: `本题用于规则模板兜底，确保在 AI 不稳定时仍能围绕 ${node} 开始正式训练。`,
+      source_kind: 'rule_fallback',
+      source_label: '规则模板',
+      validation_status: 'accepted',
+    } as VariantQuestion;
+  });
+}
+
+async function submitBestEffortInsert(table: string, payload: Record<string, unknown>) {
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user || isLocalDataApiMode()) return;
+  const result = await supabase.from(table).insert({
+    user_id: user.id,
+    ...payload,
+  });
+  if (result.error && !isMissingRelationError(result.error)) {
+    return;
+  }
+}
+
+export type SemanticDuplicatePairInput = {
+  existingQuestionText: string;
+  incomingQuestionText: string;
+};
+
+export type SemanticDuplicatePairResult = {
+  is_duplicate: boolean;
+  confidence: number;
+  reason: string;
+};
+
 // ---- Auth ----
 export const authApi = {
   register: async (email: string, password: string, name: string) => {
@@ -532,7 +1372,8 @@ export const authApi = {
 // ---- Weakness Stats ----
 export const weaknessApi = {
   getAll: async (options?: { forceRefresh?: boolean }): Promise<UserWeakness[]> => {
-    const { data: { user } } = await supabase.auth.getUser();
+    const { data: { session } } = await supabase.auth.getSession();
+    const user = session?.user;
     if (!user) throw new Error('未登录');
     const storageKey = getWeaknessCacheKey(user.id);
     const inMemory = weaknessCache.get(user.id);
@@ -575,7 +1416,7 @@ export const weaknessApi = {
     return result;
   },
   
-  incrementError: async (knowledgePoint: string, ability: string): Promise<void> => {
+  incrementError: async (knowledgePoint: string): Promise<void> => {
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) throw new Error('未登录');
 
@@ -585,7 +1426,6 @@ export const weaknessApi = {
         method: 'POST',
         body: JSON.stringify({
           knowledge_point: knowledgePoint,
-          ability,
         }),
       });
       weaknessApi.invalidateCache(user.id);
@@ -594,7 +1434,7 @@ export const weaknessApi = {
     }
     const rpc = await supabase.rpc('increment_user_weakness', {
       p_knowledge_point: knowledgePoint,
-      p_ability: ability,
+      p_ability: '',
     });
     if (!rpc.error) {
       weaknessApi.invalidateCache(user.id);
@@ -610,7 +1450,6 @@ export const weaknessApi = {
       .select('*')
       .eq('user_id', user.id)
       .eq('knowledge_point', knowledgePoint)
-      .eq('ability', ability)
       .maybeSingle();
     if (existingResult.error) throw new Error(existingResult.error.message);
     const existing = existingResult.data;
@@ -630,7 +1469,6 @@ export const weaknessApi = {
         .insert({
           user_id: user.id,
           knowledge_point: knowledgePoint,
-          ability: ability,
           error_count: 1
         });
       if (insertResult.error) throw new Error(insertResult.error.message);
@@ -649,18 +1487,150 @@ export const weaknessApi = {
   }
 };
 
+export const knowledgeNodesApi = {
+  async getAll(): Promise<Array<{ subject: string; category: string; branch?: string; node: string; tips_and_tricks: string }>> {
+    if (isLocalDataApiMode()) {
+      const token = await getAccessTokenOrLocalFallback();
+      const res = await localDataApiFetch<{ data: any }>(token, '/knowledge-nodes');
+      return Array.isArray(res.data) ? res.data.map((item: any) => normalizeKnowledgeNodeRow(item)) : [];
+    }
+    const { data, error } = await supabase.from('knowledge_nodes').select('*');
+    if (error) throw error;
+    return Array.isArray(data) ? data.map((item) => normalizeKnowledgeNodeRow(item)) : [];
+  },
+  async upsertMany(nodes: Array<{ subject: string; category: string; branch?: string; node: string; tips_and_tricks?: string }>): Promise<void> {
+    if (!nodes.length) return;
+    if (isLocalDataApiMode()) {
+      const token = await getAccessTokenOrLocalFallback();
+      await localDataApiFetch<{ data: { ok: true } }>(token, '/knowledge-nodes/upsert', {
+        method: 'POST',
+        body: JSON.stringify({ nodes }),
+      });
+      return;
+    }
+    const { error } = await supabase
+      .from('knowledge_nodes')
+      .upsert(nodes, { onConflict: 'subject,category,node' });
+    if (error) throw error;
+  },
+  async deleteNode(subject: string, node: string, category?: string): Promise<void> {
+    if (!subject || !node) return;
+    if (isLocalDataApiMode()) {
+      const token = await getAccessTokenOrLocalFallback();
+      await localDataApiFetch<{ data: { ok: true } }>(token, '/knowledge-nodes/delete', {
+        method: 'POST',
+        body: JSON.stringify({ subject, node, category }),
+      });
+      return;
+    }
+    let query = supabase
+      .from('knowledge_nodes')
+      .delete()
+      .eq('subject', subject)
+      .eq('node', node);
+    if (category) {
+      query = query.eq('category', category);
+    }
+    const { error } = await query;
+    if (error) throw error;
+  }
+};
+
+export const taxonomyApi = {
+  upsertKnowledgePoint: async (input: { subject: Subject; knowledgePoint: string; category: string; branch?: string }) => {
+    const subject = input.subject === 'C语言' ? 'C语言' : '英语';
+    const knowledgePoint = String(input.knowledgePoint || '').trim();
+    const category = String(input.category || '').trim() || '未分类';
+    const branch = String(input.branch || '').trim() || '未分类';
+    if (!knowledgePoint) {
+      throw new Error('缺少知识点名称');
+    }
+    if (isLocalDataApiMode()) {
+      const token = await getAccessTokenOrLocalFallback();
+      const response = await localDataApiFetch<{ data: any }>(token, '/taxonomy/upsert', {
+        method: 'POST',
+        body: JSON.stringify({
+          subject,
+          knowledge_point: knowledgePoint,
+          category,
+          branch,
+        }),
+      });
+      return normalizeTaxonomyWriteResult(response.data);
+    }
+    const { data, error } = await supabase.rpc('upsert_knowledge_taxonomy', {
+      p_subject: subject,
+      p_knowledge_point: knowledgePoint,
+      p_category: category,
+      p_branch: branch,
+    });
+    if (error) throw error;
+    return normalizeTaxonomyWriteResult(data);
+  },
+};
+
+export const tagIdApi = {
+  getDictionary: async () => {
+    if (isLocalDataApiMode()) {
+      const token = await getAccessToken();
+      const response = await localDataApiFetch<{ data: any }>(token, '/tag-dictionary');
+      hydrateTagDictionaryFromPayload(response.data || {});
+      return response.data;
+    }
+    await hydrateTagDictionaryOnce(true);
+    const { data: tags, error } = await supabase
+      .from('tag_catalog')
+      .select('tag_id,subject,tag_name,category,branch,code')
+      .order('tag_id', { ascending: true });
+    if (error) throw new Error(error.message);
+    return {
+      tags: tags || [],
+      dictionary: {
+        by_subject: {
+          knowledge_point: {
+            英语: getKnowledgePointsBySubject('英语'),
+            C语言: getKnowledgePointsBySubject('C语言'),
+          },
+          error_type: {},
+          ability: {},
+        },
+        all: {
+          knowledge_point: [...getKnowledgePointsBySubject('英语'), ...getKnowledgePointsBySubject('C语言')],
+          error_type: [],
+          ability: [],
+        },
+      },
+    };
+  },
+  getPaths: async (params: { tagId?: string; questionId?: string } = {}) => {
+    if (isLocalDataApiMode()) {
+      const token = await getAccessToken();
+      const query = new URLSearchParams();
+      if (params.tagId) query.set('tagId', params.tagId);
+      if (params.questionId) query.set('questionId', params.questionId);
+      const response = await localDataApiFetch<{ data: any[] }>(token, `/tag-paths?${query.toString()}`);
+      return Array.isArray(response.data) ? response.data.map((item) => attachCanonicalQuestionIds(item)) : [];
+    }
+    let request = supabase.from('questions').select('id,question_id,tag_id,id_path,knowledge_point_id,subject,knowledge_point').order('created_at', { ascending: false }).limit(200);
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) throw new Error('未登录');
+    request = request.eq('user_id', user.id);
+    if (params.tagId) request = request.eq('tag_id', params.tagId);
+    if (params.questionId) request = request.eq('question_id', params.questionId);
+    const { data, error } = await request;
+    if (error) throw new Error(error.message);
+    return Array.isArray(data) ? data.map((item) => attachCanonicalQuestionIds(item)) : [];
+  },
+};
+
 export const userLearningStateApi = {
   get: async (): Promise<UserLearningStateRecord> => {
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) throw new Error('未登录');
-    const storageKey = getLearningStateCacheKey(user.id);
+    await hydrateTagDictionaryOnce();
     const inMemory = learningStateCache.get(user.id);
-    const persisted = inMemory || await readPersistentCache<UserLearningStateRecord>('learning-state', storageKey);
-    if (persisted) {
-      learningStateCache.set(user.id, persisted);
-      if (isCacheFresh(persisted.timestamp, LEARNING_STATE_CACHE_TTL_MS)) {
-        return persisted.value;
-      }
+    if (inMemory && isCacheFresh(inMemory.timestamp, LEARNING_STATE_CACHE_TTL_MS)) {
+      return inMemory.value;
     }
     if (learningStateInFlight) {
       return learningStateInFlight;
@@ -686,7 +1656,7 @@ export const userLearningStateApi = {
         error = result.error ? new Error(result.error.message) : null;
       }
       if (error && String(error.message || '').toLowerCase().includes('does not exist')) {
-        setLearningSyncSnapshot({ state: 'synced', message: '本地已保存' });
+        setLearningSyncSnapshot({ state: 'error', message: '知识库表不存在' });
         const fallback = {
           user_id: user.id,
           ...EMPTY_USER_LEARNING_STATE,
@@ -696,11 +1666,10 @@ export const userLearningStateApi = {
           timestamp: Date.now(),
         };
         learningStateCache.set(user.id, entry);
-        await writePersistentCache('learning-state', storageKey, entry);
         return fallback;
       }
       if (error) {
-        if (persisted) return persisted.value;
+        if (inMemory) return inMemory.value;
         setLearningSyncSnapshot({ state: 'error', message: '连接失败' });
         throw new Error(error.message);
       }
@@ -715,7 +1684,6 @@ export const userLearningStateApi = {
           timestamp: Date.now(),
         };
         learningStateCache.set(user.id, entry);
-        await writePersistentCache('learning-state', storageKey, entry);
         return fallback;
       }
       setLearningSyncSnapshot({ state: 'synced', message: '已同步' });
@@ -735,7 +1703,7 @@ export const userLearningStateApi = {
         timestamp: Date.now(),
       };
       learningStateCache.set(user.id, entry);
-      await writePersistentCache('learning-state', storageKey, entry);
+      void removePersistentCache('learning-state', getLearningStateCacheKey(user.id));
       return result;
     })();
     try {
@@ -787,22 +1755,8 @@ export const userLearningStateApi = {
         error = result.error ? new Error(result.error.message) : null;
       }
       if (error && String(error.message || '').toLowerCase().includes('does not exist')) {
-        pendingLearningStatePatch = null;
-        clearRetryTimer();
-        setLearningSyncSnapshot({ state: 'synced', message: '本地已保存' });
-        const fallback = {
-          user_id: user.id,
-          tag_extensions: patch.tag_extensions ?? current.tag_extensions,
-          taxonomy_overrides: patch.taxonomy_overrides ?? current.taxonomy_overrides,
-          learning_content: patch.learning_content ?? current.learning_content,
-        };
-        const entry: CacheEntry<UserLearningStateRecord> = {
-          value: fallback,
-          timestamp: Date.now(),
-        };
-        learningStateCache.set(user.id, entry);
-        await writePersistentCache('learning-state', getLearningStateCacheKey(user.id), entry);
-        return fallback;
+        lastError = error;
+        break;
       }
       if (!error && data) {
         pendingLearningStatePatch = null;
@@ -824,12 +1778,17 @@ export const userLearningStateApi = {
           timestamp: Date.now(),
         };
         learningStateCache.set(user.id, entry);
-        await writePersistentCache('learning-state', getLearningStateCacheKey(user.id), entry);
+        void removePersistentCache('learning-state', getLearningStateCacheKey(user.id));
         return result;
       }
       lastError = error;
     }
-    setLearningSyncSnapshot({ state: 'error', message: '同步失败，自动重试中' });
+    setLearningSyncSnapshot({
+      state: 'error',
+      message: String(lastError?.message || '').toLowerCase().includes('does not exist')
+        ? '知识库表不存在'
+        : '同步失败，自动重试中',
+    });
     scheduleRetry();
     throw new Error(lastError?.message || '同步失败');
   },
@@ -846,7 +1805,7 @@ function applyQuestionQuery(source: Question[], query: QuestionQuery = {}) {
   const now = new Date();
   if (query.subject) result = result.filter(item => item.subject === query.subject);
   if (query.category) result = result.filter(item => (item.category || '未分类') === query.category);
-  if (query.l2) result = result.filter(item => (item.ability || item.error_type || '核心考点') === query.l2);
+  
   if (query.nodes && query.nodes.length > 0) {
     result = result.filter(item => query.nodes?.includes(item.node || item.knowledge_point));
   }
@@ -874,10 +1833,16 @@ function applyQuestionQuery(source: Question[], query: QuestionQuery = {}) {
     result = result.sort((a, b) => {
       const left = a.mastery_level ?? Math.round((a.confidence ?? 0.5) * 100);
       const right = b.mastery_level ?? Math.round((b.confidence ?? 0.5) * 100);
-      return left - right;
+      if (left !== right) return left - right;
+      return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
     });
   } else if (query.sortBy === 'nearestDue') {
-    result = result.sort((a, b) => new Date(a.next_review_date || 0).getTime() - new Date(b.next_review_date || 0).getTime());
+    result = result.sort((a, b) => {
+      const left = new Date(a.next_review_date || 0).getTime();
+      const right = new Date(b.next_review_date || 0).getTime();
+      if (left !== right) return left - right;
+      return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+    });
   }
   if (query.offset && query.offset > 0) {
     result = result.slice(query.offset);
@@ -907,7 +1872,6 @@ function hasQueryCondition(query: QuestionQuery = {}) {
   return Boolean(
     query.subject ||
     query.category ||
-    query.l2 ||
     (query.nodes && query.nodes.length > 0) ||
     query.onlyDue ||
     query.onlyUnmastered ||
@@ -937,7 +1901,7 @@ async function fetchQuestionsByQueryFromRemote(userId: string, query: QuestionQu
     const params = new URLSearchParams();
     if (query.subject) params.set('subject', query.subject);
     if (query.category) params.set('category', query.category);
-    if (query.l2) params.set('l2', query.l2);
+    
     if (query.nodes && query.nodes.length > 0) params.set('nodes', query.nodes.join(','));
     if (query.onlyDue) params.set('onlyDue', '1');
     if (query.onlyUnmastered) params.set('onlyUnmastered', '1');
@@ -962,9 +1926,7 @@ async function fetchQuestionsByQueryFromRemote(userId: string, query: QuestionQu
   if (query.category) {
     request = request.eq('category', query.category);
   }
-  if (query.l2) {
-    request = request.eq('ability', query.l2);
-  }
+
   if (query.nodes && query.nodes.length > 0) {
     const nodeList = buildSupabaseTextInList(query.nodes);
     request = request.or(`node.in.(${nodeList}),knowledge_point.in.(${nodeList})`);
@@ -1037,20 +1999,494 @@ function invalidateAggregateQueries() {
   void queryClient.invalidateQueries({ queryKey: ['review', 'global-error-stats'] });
 }
 
+const DEFAULT_NODE_DOSSIER_LIMIT = 20;
+
+function normalizeNodeDossierSortStrategy(input?: string): NodeDossierSortStrategy {
+  switch (String(input || '').trim()) {
+    case 'lowest_mastery':
+      return 'lowest_mastery';
+    case 'recent_edited_desc':
+      return 'recent_edited_desc';
+    case 'custom_order':
+      return 'custom_order';
+    case 'due_review_priority':
+      return 'due_review_priority';
+    default:
+      return 'recent_error_desc';
+  }
+}
+
+function toFiniteNumber(value: unknown): number | null {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function toIsoTimestamp(value: unknown, fallback = '') {
+  const raw = String(value || '').trim();
+  if (!raw) return fallback;
+  const timestamp = new Date(raw).getTime();
+  if (Number.isNaN(timestamp)) return fallback;
+  return new Date(timestamp).toISOString();
+}
+
+function getRecentEditAt(question: Question) {
+  const raw = (question as any)?.updated_at || (question as any)?.edited_at || question.created_at;
+  return toIsoTimestamp(raw, toIsoTimestamp(question.created_at, new Date(0).toISOString()));
+}
+
+function getRecentErrorAt(question: Question) {
+  return toIsoTimestamp(question.created_at, new Date(0).toISOString());
+}
+
+function getDueAt(question: Question) {
+  return toIsoTimestamp(question.next_review_date, '');
+}
+
+function clipText(input: unknown, maxLength = 72) {
+  const normalized = String(input || '').replace(/\s+/g, ' ').trim();
+  if (!normalized) return '';
+  return normalized.length > maxLength ? `${normalized.slice(0, Math.max(0, maxLength - 1)).trim()}…` : normalized;
+}
+
+function uniqueStrings(values: Array<unknown>, limit = 12) {
+  return Array.from(new Set(
+    values
+      .flatMap((item) => Array.isArray(item) ? item : [item])
+      .map((item) => String(item || '').trim())
+      .filter(Boolean),
+  )).slice(0, limit);
+}
+
+function parseNotebookSections(markdown: string, nodeId: string) {
+  const normalizedMarkdown = String(markdown || '').replace(/\r\n/g, '\n').trim();
+  if (!normalizedMarkdown) return [];
+  const lines = normalizedMarkdown.split('\n');
+  const sections: Array<{ title: string; lines: string[] }> = [];
+  let currentTitle = '未分节笔记';
+  let currentLines: string[] = [];
+  const pushCurrent = () => {
+    const content = currentLines.join('\n').trim();
+    if (!content && sections.length > 0) return;
+    sections.push({
+      title: currentTitle,
+      lines: content ? content.split('\n') : [],
+    });
+  };
+  for (const line of lines) {
+    const heading = line.match(/^#{1,3}\s+(.+)$/);
+    if (heading?.[1]) {
+      if (currentLines.length > 0 || sections.length === 0) {
+        pushCurrent();
+      }
+      currentTitle = clipText(heading[1], 40) || '未命名章节';
+      currentLines = [line];
+      continue;
+    }
+    currentLines.push(line);
+  }
+  if (currentLines.length > 0) {
+    pushCurrent();
+  }
+  return sections
+    .map((section, index) => {
+      const contentMarkdown = section.lines.join('\n').trim();
+      return {
+        section_id: `${nodeId}::section_${index + 1}`,
+        order: index + 1,
+        title: section.title,
+        content_markdown: contentMarkdown,
+        preview: clipText(contentMarkdown.replace(/^#{1,3}\s+/gm, ''), 120),
+      };
+    })
+    .filter((section, index, array) => Boolean(section.content_markdown) || (index === 0 && array.length === 1));
+}
+
+function buildQuestionKeywords(question: Question) {
+  const payloadKeywords = Array.isArray((question.normalized_payload as any)?.keywords)
+    ? ((question.normalized_payload as any)?.keywords as unknown[])
+    : [];
+  return uniqueStrings([
+    question.subject,
+    question.knowledge_point,
+    question.node,
+    question.category,
+    question.question_text,
+    question.correct_answer,
+    question.note,
+    question.summary,
+    payloadKeywords,
+  ], 16);
+}
+
+function buildSortMetrics(question: Question, strategy: NodeDossierSortStrategy, displayOrder: number): NodeDossierSortMetric[] {
+  const masteryLevel = question.mastery_level ?? Math.round((question.confidence ?? 0.5) * 100);
+  const dueAt = getDueAt(question) || null;
+  return [
+    { key: 'display_order', label: '排序位置', value: displayOrder },
+    { key: 'strategy', label: '排序策略', value: strategy },
+    { key: 'mastery_level', label: '掌握度', value: masteryLevel },
+    { key: 'review_count', label: '复习次数', value: toFiniteNumber(question.review_count) ?? 0 },
+    { key: 'recent_error_at', label: '最近出错时间', value: getRecentErrorAt(question) },
+    { key: 'recent_edit_at', label: '最近编辑时间', value: getRecentEditAt(question) },
+    { key: 'due_at', label: '下次复习时间', value: dueAt },
+  ];
+}
+
+function buildSortReason(question: Question, strategy: NodeDossierSortStrategy, displayOrder: number) {
+  const masteryLevel = question.mastery_level ?? Math.round((question.confidence ?? 0.5) * 100);
+  if (strategy === 'lowest_mastery') {
+    return `第 ${displayOrder} 位：当前掌握度 ${masteryLevel}，优先暴露薄弱题。`;
+  }
+  if (strategy === 'recent_edited_desc') {
+    return `第 ${displayOrder} 位：最近编辑时间为 ${getRecentEditAt(question)}。`;
+  }
+  if (strategy === 'custom_order') {
+    return `第 ${displayOrder} 位：沿用当前自定义顺序快照。`;
+  }
+  if (strategy === 'due_review_priority') {
+    return getDueAt(question)
+      ? `第 ${displayOrder} 位：该题已进入待复习窗口，复习时间 ${getDueAt(question)}。`
+      : `第 ${displayOrder} 位：无明确复习时间，按薄弱度与最近错题时间补位。`;
+  }
+  return `第 ${displayOrder} 位：最近出错时间为 ${getRecentErrorAt(question)}。`;
+}
+
+function compareQuestionsByStrategy(left: Question, right: Question, strategy: NodeDossierSortStrategy) {
+  const leftMastery = left.mastery_level ?? Math.round((left.confidence ?? 0.5) * 100);
+  const rightMastery = right.mastery_level ?? Math.round((right.confidence ?? 0.5) * 100);
+  const leftErrorAt = new Date(getRecentErrorAt(left)).getTime();
+  const rightErrorAt = new Date(getRecentErrorAt(right)).getTime();
+  const leftEditAt = new Date(getRecentEditAt(left)).getTime();
+  const rightEditAt = new Date(getRecentEditAt(right)).getTime();
+  const leftDueAt = new Date(getDueAt(left) || '9999-12-31T00:00:00.000Z').getTime();
+  const rightDueAt = new Date(getDueAt(right) || '9999-12-31T00:00:00.000Z').getTime();
+  const leftCustomOrder = toFiniteNumber((left as any)?.display_order ?? (left as any)?.sort_order ?? (left as any)?.custom_order) ?? Number.MAX_SAFE_INTEGER;
+  const rightCustomOrder = toFiniteNumber((right as any)?.display_order ?? (right as any)?.sort_order ?? (right as any)?.custom_order) ?? Number.MAX_SAFE_INTEGER;
+  if (strategy === 'lowest_mastery') {
+    if (leftMastery !== rightMastery) return leftMastery - rightMastery;
+    return rightErrorAt - leftErrorAt;
+  }
+  if (strategy === 'recent_edited_desc') {
+    if (leftEditAt !== rightEditAt) return rightEditAt - leftEditAt;
+    return rightErrorAt - leftErrorAt;
+  }
+  if (strategy === 'custom_order') {
+    if (leftCustomOrder !== rightCustomOrder) return leftCustomOrder - rightCustomOrder;
+    return rightErrorAt - leftErrorAt;
+  }
+  if (strategy === 'due_review_priority') {
+    if (leftDueAt !== rightDueAt) return leftDueAt - rightDueAt;
+    if (leftMastery !== rightMastery) return leftMastery - rightMastery;
+    return rightErrorAt - leftErrorAt;
+  }
+  return rightErrorAt - leftErrorAt;
+}
+
+function deriveNodeNotebook(
+  learningState: UserLearningStateRecord,
+  params: {
+    tagId: string;
+    nodeId: string;
+    tagName: string;
+    nodeName: string;
+  },
+) {
+  const drawerByTag = learningState.learning_content?.drawerByTag || {};
+  const sourceKey = [
+    params.nodeId,
+    params.nodeName,
+    params.tagId,
+    params.tagName,
+  ].map((item) => String(item || '').trim()).find((item) => item && drawerByTag[item]) || '';
+  const drawer = sourceKey ? drawerByTag[sourceKey] : undefined;
+  const contentMarkdown = String(drawer?.markdown || '').trim();
+  const summary = clipText(drawer?.summary || contentMarkdown, 160);
+  return {
+    node_id: params.nodeId,
+    tag_id: params.tagId,
+    title: String(drawer?.title || params.nodeName || params.tagName || '知识点笔记').trim(),
+    summary,
+    content_markdown: contentMarkdown,
+    source_key: sourceKey || params.nodeId || params.nodeName || params.tagId || params.tagName,
+    sections: parseNotebookSections(contentMarkdown, params.nodeId),
+  };
+}
+
+function buildSnapshotVersion(parts: Array<unknown>) {
+  return `node-${parts.map((item) => String(item || '').trim()).join('--')}`;
+}
+
+async function resolveNodeScope(query: NodeDossierQuery | NodeMistakeLookupQuery) {
+  const questions = await questionsApi.getAll({ includeArchived: true });
+  const activeIds = uniqueStrings([
+    query.activeMistakeId,
+    query.activeMistakeIds || [],
+    (query as NodeMistakeLookupQuery).mistakeId,
+  ], 20);
+  const activePool = activeIds.length > 0
+    ? questions.filter((question) => activeIds.includes(resolveCanonicalMistakeId(question)))
+    : [];
+  const candidatePool = questions.filter((question) => {
+    const tagId = resolveCanonicalTagId(question);
+    const nodeId = resolveCanonicalNodeId(question);
+    if (query.tagId && tagId !== query.tagId) return false;
+    if (query.nodeId && nodeId !== query.nodeId) return false;
+    return true;
+  });
+  const workingPool = candidatePool.length > 0 ? candidatePool : activePool;
+  const firstQuestion = activePool[0] || workingPool[0] || questions[0] || null;
+  const inferredTagId = String(query.tagId || resolveCanonicalTagId(firstQuestion) || '').trim();
+  const inferredNodeId = String(query.nodeId || resolveCanonicalNodeId(firstQuestion) || '').trim();
+  const scopedQuestions = questions.filter((question) => {
+    if (inferredTagId && resolveCanonicalTagId(question) !== inferredTagId) return false;
+    if (inferredNodeId && resolveCanonicalNodeId(question) !== inferredNodeId) return false;
+    return true;
+  });
+  const scopeSeed = scopedQuestions[0] || firstQuestion || {};
+  return {
+    questions,
+    scopedQuestions,
+    tagId: inferredTagId,
+    nodeId: inferredNodeId,
+    tagName: String((scopeSeed as any)?.category || (scopeSeed as any)?.tag_name || (scopeSeed as any)?.knowledge_point || '').trim(),
+    nodeName: String((scopeSeed as any)?.node || (scopeSeed as any)?.knowledge_point || (scopeSeed as any)?.name || '').trim(),
+  };
+}
+
+function buildNodeMistakeIndexEntry(
+  question: Question,
+  strategy: NodeDossierSortStrategy,
+  displayOrder: number,
+): NodeMistakeIndexEntry {
+  const masteryLevel = question.mastery_level ?? Math.round((question.confidence ?? 0.5) * 100);
+  return {
+    mistake_id: resolveCanonicalMistakeId(question),
+    tag_id: resolveCanonicalTagId(question),
+    node_id: resolveCanonicalNodeId(question),
+    id_path: question.id_path,
+    display_order: displayOrder,
+    sort_position: displayOrder,
+    sort_strategy: strategy,
+    sort_reason: buildSortReason(question, strategy, displayOrder),
+    title_excerpt: clipText(question.question_text, 96),
+    answer_excerpt: clipText(question.correct_answer || getStemFromPayload(question.normalized_payload), 80),
+    mistake_excerpt: clipText(question.note || question.summary, 80),
+    mastery_level: masteryLevel,
+    recent_error_at: getRecentErrorAt(question),
+    recent_edit_at: getRecentEditAt(question),
+    due_at: getDueAt(question) || null,
+    keywords: buildQuestionKeywords(question),
+    metrics: buildSortMetrics(question, strategy, displayOrder),
+  };
+}
+
+function rankNodeQuestions(questions: Question[], strategy: NodeDossierSortStrategy) {
+  return [...questions]
+    .sort((left, right) => compareQuestionsByStrategy(left, right, strategy))
+    .map((question, index) => ({
+      question,
+      entry: buildNodeMistakeIndexEntry(question, strategy, index + 1),
+    }));
+}
+
+function filterRankedNodeQuestions(
+  rankedQuestions: Array<{ question: Question; entry: NodeMistakeIndexEntry }>,
+  query: NodeMistakeLookupQuery,
+) {
+  const keyword = String(query.keyword || '').trim().toLowerCase();
+  const mistakeId = String(query.mistakeId || '').trim();
+  const createdAfter = query.createdAfter ? new Date(query.createdAfter).getTime() : Number.NEGATIVE_INFINITY;
+  const createdBefore = query.createdBefore ? new Date(query.createdBefore).getTime() : Number.POSITIVE_INFINITY;
+  const dueAfter = query.dueAfter ? new Date(query.dueAfter).getTime() : Number.NEGATIVE_INFINITY;
+  const dueBefore = query.dueBefore ? new Date(query.dueBefore).getTime() : Number.POSITIVE_INFINITY;
+  return rankedQuestions.filter(({ question, entry }) => {
+    if (mistakeId && entry.mistake_id !== mistakeId) return false;
+    if (keyword) {
+      const haystack = [
+        entry.title_excerpt,
+        entry.answer_excerpt,
+        entry.mistake_excerpt,
+        entry.keywords.join(' '),
+      ].join(' ').toLowerCase();
+      if (!haystack.includes(keyword)) return false;
+    }
+    const createdAt = new Date(entry.recent_error_at).getTime();
+    if (createdAt < createdAfter || createdAt > createdBefore) return false;
+    const dueAt = entry.due_at ? new Date(entry.due_at).getTime() : Number.NaN;
+    if (!Number.isNaN(dueAt) && (dueAt < dueAfter || dueAt > dueBefore)) return false;
+    if ((query.offset || 0) > 0 && entry.sort_position <= Number(query.offset || 0)) {
+      return true;
+    }
+    return true;
+  });
+}
+
+export const nodeDossierApi = {
+  getNodeDossier: async (query: NodeDossierQuery = {}): Promise<NodeDossier> => {
+    const scope = await resolveNodeScope(query);
+    const strategy = normalizeNodeDossierSortStrategy(query.sortBy);
+    const ranking = rankNodeQuestions(scope.scopedQuestions, strategy);
+    const offset = Math.max(0, Number(query.offset || 0));
+    const limit = Math.max(1, Number(query.limit || DEFAULT_NODE_DOSSIER_LIMIT));
+    const visibleRanking = ranking.slice(offset, offset + limit);
+    const learningState = await userLearningStateApi.get();
+    const notebook = deriveNodeNotebook(learningState, {
+      tagId: scope.tagId,
+      nodeId: scope.nodeId,
+      tagName: scope.tagName,
+      nodeName: scope.nodeName,
+    });
+    const averageMastery = scope.scopedQuestions.length > 0
+      ? Math.round(scope.scopedQuestions.reduce((sum, item) => sum + (item.mastery_level ?? Math.round((item.confidence ?? 0.5) * 100)), 0) / scope.scopedQuestions.length)
+      : null;
+    const activeIds = uniqueStrings([query.activeMistakeId, query.activeMistakeIds || []], 20);
+    const activeMistakes = activeIds.length > 0
+      ? scope.scopedQuestions.filter((question) => activeIds.includes(resolveCanonicalMistakeId(question)))
+      : [];
+    const snapshotVersion = buildSnapshotVersion([
+      scope.tagId,
+      scope.nodeId,
+      strategy,
+      scope.scopedQuestions.length,
+      ranking[0]?.entry?.mistake_id || 'empty',
+      ranking[0]?.entry?.recent_edit_at || new Date(0).toISOString(),
+      learningState.updated_at || '',
+    ]);
+    return {
+      snapshot_version: snapshotVersion,
+      scope: {
+        surface: query.surface || 'question_bank',
+        tag_id: scope.tagId,
+        node_id: scope.nodeId,
+        tag_name: scope.tagName,
+        node_name: scope.nodeName,
+      },
+      summary: {
+        mistake_count: scope.scopedQuestions.length,
+        visible_count: visibleRanking.length,
+        due_count: scope.scopedQuestions.filter((question) => {
+          const dueAt = getDueAt(question);
+          return Boolean(dueAt) && new Date(dueAt).getTime() <= Date.now();
+        }).length,
+        average_mastery_level: averageMastery,
+        sort_strategy: strategy,
+      },
+      relation_graph: {
+        tag_id: scope.tagId,
+        node_id: scope.nodeId,
+        mistake_ids: ranking.map((item) => item.entry.mistake_id),
+        mistake_count: scope.scopedQuestions.length,
+      },
+      pagination: {
+        total: ranking.length,
+        offset,
+        limit,
+        has_more: offset + visibleRanking.length < ranking.length,
+        next_offset: offset + visibleRanking.length < ranking.length ? offset + visibleRanking.length : null,
+      },
+      mistake_index: visibleRanking.map((item) => item.entry),
+      active_mistake_id: activeMistakes[0] ? resolveCanonicalMistakeId(activeMistakes[0]) : null,
+      active_mistake_ids: activeMistakes.map((item) => resolveCanonicalMistakeId(item)),
+      active_mistake: activeMistakes[0] || null,
+      active_mistakes: activeMistakes,
+      node_notebook: notebook,
+    };
+  },
+  exportNodeDossierFile: async (query: NodeDossierQuery = {}): Promise<NodeDossierFileExport> => {
+    const dossier = await nodeDossierApi.getNodeDossier(query);
+    return {
+      file_name: `${dossier.scope.tag_id || 'tag'}__${dossier.scope.node_id || 'node'}__${dossier.snapshot_version}.json`,
+      content_type: 'application/json',
+      content: JSON.stringify(dossier, null, 2),
+      snapshot_version: dossier.snapshot_version,
+    };
+  },
+  listNodeMistakes: async (query: NodeDossierQuery = {}) => {
+    const dossier = await nodeDossierApi.getNodeDossier(query);
+    return {
+      snapshot_version: dossier.snapshot_version,
+      scope: dossier.scope,
+      pagination: dossier.pagination,
+      entries: dossier.mistake_index,
+    };
+  },
+  searchNodeMistakes: async (query: NodeMistakeLookupQuery = {}) => {
+    const scope = await resolveNodeScope(query);
+    const strategy = normalizeNodeDossierSortStrategy(query.sortBy);
+    const ranking = rankNodeQuestions(scope.scopedQuestions, strategy);
+    const filtered = filterRankedNodeQuestions(ranking, query);
+    const offset = Math.max(0, Number(query.offset || 0));
+    const limit = Math.max(1, Number(query.limit || DEFAULT_NODE_DOSSIER_LIMIT));
+    const visible = filtered.slice(offset, offset + limit);
+    const snapshotVersion = buildSnapshotVersion([
+      scope.tagId,
+      scope.nodeId,
+      strategy,
+      filtered.length,
+      visible[0]?.entry?.mistake_id || 'empty',
+    ]);
+    return {
+      snapshot_version: snapshotVersion,
+      scope: {
+        tag_id: scope.tagId,
+        node_id: scope.nodeId,
+        tag_name: scope.tagName,
+        node_name: scope.nodeName,
+      },
+      pagination: {
+        total: filtered.length,
+        offset,
+        limit,
+        has_more: offset + visible.length < filtered.length,
+        next_offset: offset + visible.length < filtered.length ? offset + visible.length : null,
+      },
+      entries: visible.map((item) => item.entry),
+    };
+  },
+  getMistakeAtPosition: async (query: NodeDossierQuery & { position: number }) => {
+    const scope = await resolveNodeScope(query);
+    const strategy = normalizeNodeDossierSortStrategy(query.sortBy);
+    const ranking = rankNodeQuestions(scope.scopedQuestions, strategy);
+    const matched = ranking[Math.max(0, Number(query.position || 1) - 1)] || null;
+    return matched ? {
+      snapshot_version: buildSnapshotVersion([scope.tagId, scope.nodeId, strategy, matched.entry.mistake_id, matched.entry.sort_position]),
+      scope: {
+        tag_id: scope.tagId,
+        node_id: scope.nodeId,
+        tag_name: scope.tagName,
+        node_name: scope.nodeName,
+      },
+      entry: matched.entry,
+      detail: matched.question,
+    } : null;
+  },
+  compareMistakes: async (query: NodeDossierQuery & { mistakeIds: string[] }) => {
+    const scope = await resolveNodeScope(query);
+    const strategy = normalizeNodeDossierSortStrategy(query.sortBy);
+    const ranking = rankNodeQuestions(scope.scopedQuestions, strategy);
+    const requested = uniqueStrings(query.mistakeIds || [], 20);
+    const matched = ranking.filter((item) => requested.includes(item.entry.mistake_id));
+    return {
+      snapshot_version: buildSnapshotVersion([scope.tagId, scope.nodeId, strategy, matched.length]),
+      scope: {
+        tag_id: scope.tagId,
+        node_id: scope.nodeId,
+        tag_name: scope.tagName,
+        node_name: scope.nodeName,
+      },
+      entries: matched.map((item) => item.entry),
+      details: matched.map((item) => item.question),
+    };
+  },
+};
+
 // ---- Questions ----
 export const questionsApi = {
   getAll: async (query: QuestionQuery = {}, options?: { forceRefresh?: boolean }): Promise<Question[]> => {
-    const { data: { user } } = await supabase.auth.getUser();
+    const authResult = await supabase.auth.getSession();
+    const user = authResult?.data?.session?.user;
     if (!user) throw new Error('未登录');
     const startedAt = Date.now();
-    if (hasQueryCondition(query)) {
-      try {
-        const remote = await fetchQuestionsByQueryFromRemote(user.id, query);
-        trackCacheEvent('cache_questions_query_remote', startedAt);
-        return applyQuestionQuery(remote, query);
-      } catch {
-      }
-    }
     const storageKey = getQuestionsCacheKey(user.id);
     const inMemory = questionsCache.get(user.id);
     const persisted = inMemory || await readPersistentCache<Question[]>('questions', storageKey);
@@ -1088,7 +2524,8 @@ export const questionsApi = {
   },
 
   getCached: async (query: QuestionQuery = {}): Promise<Question[] | null> => {
-    const { data: { user } } = await supabase.auth.getUser();
+    const { data: { session } } = await supabase.auth.getSession();
+    const user = session?.user;
     if (!user) return null;
     const inMemory = questionsCache.get(user.id);
     const persisted = inMemory || await readPersistentCache<Question[]>('questions', getQuestionsCacheKey(user.id));
@@ -1100,118 +2537,46 @@ export const questionsApi = {
   },
 
   getRevision: async (): Promise<string> => {
-    const { data: { user } } = await supabase.auth.getUser();
+    const { data: { session } } = await supabase.auth.getSession();
+    const user = session?.user;
     if (!user) throw new Error('未登录');
     return probeQuestionsSignature(user.id);
   },
 
   count: async (query: QuestionQuery = {}): Promise<number> => {
-    const { data: { user } } = await supabase.auth.getUser();
-    if (!user) throw new Error('未登录');
-    if (query.onlyUnmastered) {
-      const remote = await fetchQuestionsByQueryFromRemote(user.id, {
-        ...query,
-        onlyUnmastered: false,
-        limit: undefined,
-        offset: undefined,
-      });
-      return applyQuestionQuery(remote, {
-        ...query,
-        limit: undefined,
-        offset: undefined,
-      }).length;
-    }
-    if (isLocalDataApiMode()) {
-      const params = new URLSearchParams();
-      if (query.subject) params.set('subject', query.subject);
-      if (query.category) params.set('category', query.category);
-      if (query.l2) params.set('l2', query.l2);
-      if (query.nodes && query.nodes.length > 0) params.set('nodes', query.nodes.join(','));
-      if (query.onlyDue) params.set('onlyDue', '1');
-      if (query.onlyStubborn) params.set('onlyStubborn', '1');
-      if (query.includeArchived) params.set('includeArchived', '1');
-      if (query.onlyArchived) params.set('onlyArchived', '1');
-      const token = await getAccessToken();
-      const response = await localDataApiFetch<{ data: { count: number } }>(token, `/questions/count?${params.toString()}`);
-      return Number(response.data?.count || 0);
-    }
-    let request = supabase
-      .from('questions')
-      .select('id', { count: 'exact', head: true })
-      .eq('user_id', user.id);
-
-    if (query.subject) {
-      request = request.eq('subject', query.subject);
-    }
-    if (query.category) {
-      request = request.eq('category', query.category);
-    }
-    if (query.l2) {
-      request = request.eq('ability', query.l2);
-    }
-    if (query.nodes && query.nodes.length > 0) {
-      const nodeList = buildSupabaseTextInList(query.nodes);
-      request = request.or(`node.in.(${nodeList}),knowledge_point.in.(${nodeList})`);
-    }
-    if (query.onlyStubborn) {
-      request = request.eq('stubborn_flag', true);
-    }
-    if (query.onlyArchived) {
-      request = request.eq('is_archived', true);
-    } else if (!query.includeArchived) {
-      request = request.eq('is_archived', false);
-    }
-    if (query.onlyDue) {
-      const nowIso = new Date().toISOString();
-      request = request.or(`next_review_date.is.null,next_review_date.lte.${nowIso}`);
-    }
-    const { count, error } = await request;
-    if (error) throw new Error(error.message);
-    return count || 0;
+    const list = await questionsApi.getAll({
+      ...query,
+      limit: undefined,
+      offset: undefined,
+    });
+    return list.length;
   },
 
   countDue: async (query: Pick<QuestionQuery, 'subject'> = {}): Promise<number> => {
-    const { data: { user } } = await supabase.auth.getUser();
-    if (!user) throw new Error('未登录');
-    if (isLocalDataApiMode()) {
-      const params = new URLSearchParams();
-      params.set('onlyDue', '1');
-      if (query.subject) params.set('subject', query.subject);
-      const token = await getAccessToken();
-      const response = await localDataApiFetch<{ data: { count: number } }>(token, `/questions/count?${params.toString()}`);
-      return Number(response.data?.count || 0);
-    }
-    const nowIso = new Date().toISOString();
-    let request = supabase
-      .from('questions')
-      .select('id', { count: 'exact', head: true })
-      .eq('user_id', user.id)
-      .eq('is_archived', false)
-      .or(`next_review_date.is.null,next_review_date.lte.${nowIso}`);
-    if (query.subject) {
-      request = request.eq('subject', query.subject);
-    }
-    const { count, error } = await request;
-    if (error) throw new Error(error.message);
-    return count || 0;
+    const list = await questionsApi.getAll({
+      ...query,
+      onlyDue: true,
+      includeArchived: false,
+      limit: undefined,
+      offset: undefined,
+    });
+    return list.length;
   },
 
   create: async (q: Partial<Question>): Promise<Question> => {
-    const { data: { user } } = await supabase.auth.getUser();
+    const authResult = await supabase.auth.getUser();
+    const user = authResult?.data?.user;
     if (!user) throw new Error('未登录');
     const canonicalTags = await normalizeQuestionTagsForWrite({
       subject: q.subject,
       knowledgePoint: q.knowledge_point,
-      ability: q.ability,
-      errorType: q.error_type,
     });
     const normalized = normalizeQuestionPayload({
       ...(q as Partial<Question> & { options?: string[] }),
       subject: canonicalTags.subject,
       knowledge_point: canonicalTags.knowledgePoint,
-      ability: canonicalTags.ability,
-      error_type: canonicalTags.errorType,
     });
+    const masteryState = normalizeMasteryStateForInsert(normalized.mastery_state);
     const fullInsertPayload = {
       p_subject: normalized.subject,
       p_question_text: normalized.question_text,
@@ -1219,8 +2584,6 @@ export const questionsApi = {
       p_node: normalized.node,
       p_image_url: normalized.image_url,
       p_knowledge_point: normalized.knowledge_point,
-      p_ability: normalized.ability,
-      p_error_type: normalized.error_type,
       p_question_type: normalized.question_type,
       p_correct_answer: normalized.correct_answer,
       p_raw_ai_response: normalized.raw_ai_response,
@@ -1248,8 +2611,6 @@ export const questionsApi = {
           node: normalized.node,
           image_url: normalized.image_url,
           knowledge_point: normalized.knowledge_point,
-          ability: normalized.ability,
-          error_type: normalized.error_type,
           question_type: normalized.question_type,
           correct_answer: normalized.correct_answer,
           raw_ai_response: normalized.raw_ai_response,
@@ -1263,7 +2624,7 @@ export const questionsApi = {
           mastery_level: normalized.mastery_level,
           next_review_date: normalized.next_review_date,
           stubborn_flag: normalized.stubborn_flag,
-          mastery_state: normalized.mastery_state,
+          mastery_state: masteryState,
           mastered_at: normalized.mastered_at,
           is_archived: normalized.is_archived,
           archived_at: normalized.archived_at,
@@ -1276,58 +2637,60 @@ export const questionsApi = {
       return normalizeQuestionRow(response.data);
     }
     
-    const rpcResult = await supabase.rpc('create_question', fullInsertPayload).select().maybeSingle();
-    let insertedData = rpcResult.data;
-    
-    if (rpcResult.error || !insertedData) {
-      const directPayload = {
-        user_id: user.id,
-        subject: normalized.subject,
-        question_text: normalized.question_text,
-        category: normalized.category,
-        node: normalized.node,
-        image_url: normalized.image_url,
-        knowledge_point: normalized.knowledge_point,
-        ability: normalized.ability,
-        error_type: normalized.error_type,
-        question_type: normalized.question_type,
-        correct_answer: normalized.correct_answer,
-        raw_ai_response: normalized.raw_ai_response,
-        normalized_payload: normalized.normalized_payload,
-        payload_version: normalized.payload_version,
-        validation_status: normalized.validation_status,
-        render_mode: normalized.render_mode,
-        note: normalized.note,
-        summary: normalized.summary,
-        confidence: normalized.confidence,
-        mastery_level: normalized.mastery_level,
-        next_review_date: normalized.next_review_date,
-        stubborn_flag: normalized.stubborn_flag,
-        mastery_state: normalized.mastery_state,
-        mastered_at: normalized.mastered_at,
-        is_archived: normalized.is_archived,
-        archived_at: normalized.archived_at,
-        review_count: normalized.review_count || 0,
-      };
+    const directPayload = {
+      user_id: user.id,
+      subject: normalized.subject,
+      question_text: normalized.question_text,
+      category: normalized.category,
+      node: normalized.node,
+      image_url: normalized.image_url,
+      knowledge_point: normalized.knowledge_point,
+      question_type: normalized.question_type,
+      correct_answer: normalized.correct_answer,
+      raw_ai_response: normalized.raw_ai_response,
+      normalized_payload: normalized.normalized_payload,
+      payload_version: normalized.payload_version,
+      validation_status: normalized.validation_status,
+      render_mode: normalized.render_mode,
+      note: normalized.note,
+      summary: normalized.summary,
+      confidence: normalized.confidence,
+      mastery_level: normalized.mastery_level,
+      next_review_date: normalized.next_review_date,
+      stubborn_flag: normalized.stubborn_flag,
+      mastery_state: masteryState,
+      mastered_at: normalized.mastered_at,
+      is_archived: normalized.is_archived,
+      archived_at: normalized.archived_at,
+      review_count: normalized.review_count || 0,
+    };
 
-      let insertResult = await supabase.from('questions').insert(directPayload).select().single();
-      if (insertResult.error && isMissingColumnError(insertResult.error) && isLegacyDbFallbackEnabled()) {
-        const legacyInsertPayload = { ...directPayload };
-        delete (legacyInsertPayload as any).question_type;
-        delete (legacyInsertPayload as any).correct_answer;
-        delete (legacyInsertPayload as any).raw_ai_response;
-        delete (legacyInsertPayload as any).normalized_payload;
-        delete (legacyInsertPayload as any).payload_version;
-        delete (legacyInsertPayload as any).validation_status;
-        delete (legacyInsertPayload as any).render_mode;
-        insertResult = await supabase.from('questions').insert(legacyInsertPayload).select().single();
-      }
-      if (insertResult.error) throw new Error(insertResult.error.message);
-      insertedData = insertResult.data;
-      
-      if (normalized.knowledge_point && normalized.ability) {
-        await weaknessApi.incrementError(normalized.knowledge_point, normalized.ability);
-      }
+    let insertResult = await supabase.from('questions').insert(directPayload).select().single();
+    if (insertResult.error && isMissingColumnError(insertResult.error) && isLegacyDbFallbackEnabled()) {
+      const legacyInsertPayload = { ...directPayload };
+      delete (legacyInsertPayload as any).question_type;
+      delete (legacyInsertPayload as any).correct_answer;
+      delete (legacyInsertPayload as any).raw_ai_response;
+      delete (legacyInsertPayload as any).normalized_payload;
+      delete (legacyInsertPayload as any).payload_version;
+      delete (legacyInsertPayload as any).validation_status;
+      delete (legacyInsertPayload as any).render_mode;
+      insertResult = await supabase.from('questions').insert(legacyInsertPayload).select().single();
+    }
+
+    let insertedData = insertResult.data;
+    let usedDirectInsert = !insertResult.error && Boolean(insertResult.data);
+
+    if (insertResult.error || !insertedData) {
+      const rpcResult = await supabase.rpc('create_question', fullInsertPayload).select().maybeSingle();
+      if (rpcResult.error) throw new Error(rpcResult.error.message);
+      if (!rpcResult.data) throw new Error('入库失败：创建错题未返回数据');
+      insertedData = rpcResult.data;
+      usedDirectInsert = false;
+    }
+
+    if (usedDirectInsert && normalized.knowledge_point) {
+      await weaknessApi.incrementError(normalized.knowledge_point);
     }
     
     invalidateQuestionsCache(user.id);
@@ -1337,28 +2700,33 @@ export const questionsApi = {
   },
 
   update: async (id: string, updates: Partial<Question>): Promise<Question> => {
+    const authResult = await supabase.auth.getUser();
+    const user = authResult?.data?.user;
+    if (!user) throw new Error('未登录');
+    const targetRowId = await resolveStoredQuestionRowId(id);
     const normalized = (updates.question_text !== undefined || updates.correct_answer !== undefined || updates.question_type !== undefined)
       ? normalizeQuestionPayload(updates as Partial<Question> & { options?: string[] })
       : updates;
+    const sanitizedUpdates = sanitizeMasteryStateForUpdate(normalized);
     if (isLocalDataApiMode()) {
       const token = await getAccessToken();
       const response = await localDataApiFetch<{ data: Question }>(token, '/questions/update', {
         method: 'POST',
         body: JSON.stringify({
-          id,
-          updates: normalized,
+          id: targetRowId,
+          updates: sanitizedUpdates,
         }),
       });
-      invalidateQuestionsCache();
-      statsApi.invalidateCache();
+      invalidateQuestionsCache(user.id);
+      statsApi.invalidateCache(user.id);
       invalidateAggregateQueries();
       return normalizeQuestionRow(response.data);
     }
-    let effectiveUpdates = normalized;
+    let effectiveUpdates = sanitizedUpdates;
     let updateResult = await supabase
       .from('questions')
       .update(effectiveUpdates)
-      .eq('id', id)
+      .eq('id', targetRowId)
       .select()
       .maybeSingle();
     if (updateResult.error && isMissingColumnError(updateResult.error) && isLegacyDbFallbackEnabled()) {
@@ -1383,34 +2751,34 @@ export const questionsApi = {
       updateResult = await supabase
         .from('questions')
         .update(effectiveUpdates)
-        .eq('id', id)
+        .eq('id', targetRowId)
         .select()
         .maybeSingle();
     }
     if (updateResult.error) throw new Error(updateResult.error.message);
     if (updateResult.data) {
-      invalidateQuestionsCache();
-      statsApi.invalidateCache();
+      invalidateQuestionsCache(user.id);
+      statsApi.invalidateCache(user.id);
       invalidateAggregateQueries();
       return normalizeQuestionRow(updateResult.data);
     }
     const refetch = await supabase
       .from('questions')
       .select('*')
-      .eq('id', id)
+      .eq('id', targetRowId)
       .maybeSingle();
     if (refetch.error) throw new Error(refetch.error.message);
     if (refetch.data) {
-      invalidateQuestionsCache();
-      statsApi.invalidateCache();
+      invalidateQuestionsCache(user.id);
+      statsApi.invalidateCache(user.id);
       invalidateAggregateQueries();
       return normalizeQuestionRow(refetch.data);
     }
-    invalidateQuestionsCache();
-    statsApi.invalidateCache();
+    invalidateQuestionsCache(user.id);
+    statsApi.invalidateCache(user.id);
     invalidateAggregateQueries();
     return normalizeQuestionRow({
-      id,
+      id: targetRowId,
       ...effectiveUpdates,
     });
   },
@@ -1419,16 +2787,19 @@ export const questionsApi = {
     if (!ids || ids.length === 0) return 0;
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) throw new Error('未登录');
+    const resolvedIds = (await Promise.all(ids.map((id) => resolveStoredQuestionRowId(id)))).filter(Boolean);
+    if (resolvedIds.length === 0) return 0;
     const normalized = (updates.question_text !== undefined || updates.correct_answer !== undefined || updates.question_type !== undefined)
       ? normalizeQuestionPayload(updates as Partial<Question> & { options?: string[] })
       : updates;
+    const sanitizedUpdates = sanitizeMasteryStateForUpdate(normalized);
     if (isLocalDataApiMode()) {
       const token = await getAccessToken();
       const response = await localDataApiFetch<{ data: { updated: number } }>(token, '/questions/batch-update', {
         method: 'POST',
         body: JSON.stringify({
-          ids,
-          updates: normalized,
+          ids: resolvedIds,
+          updates: sanitizedUpdates,
         }),
       });
       invalidateQuestionsCache(user.id);
@@ -1436,12 +2807,12 @@ export const questionsApi = {
       invalidateAggregateQueries();
       return Number(response.data?.updated || 0);
     }
-    let effectiveUpdates = normalized;
+    let effectiveUpdates = sanitizedUpdates;
     let updateResult = await supabase
       .from('questions')
       .update(effectiveUpdates)
       .eq('user_id', user.id)
-      .in('id', ids)
+      .in('id', resolvedIds)
       .select('id');
     if (updateResult.error && isMissingColumnError(updateResult.error) && isLegacyDbFallbackEnabled()) {
       const legacyUpdates = { ...updates };
@@ -1466,7 +2837,7 @@ export const questionsApi = {
         .from('questions')
         .update(effectiveUpdates)
         .eq('user_id', user.id)
-        .in('id', ids)
+        .in('id', resolvedIds)
         .select('id');
     }
     if (updateResult.error) throw new Error(updateResult.error.message);
@@ -1477,25 +2848,28 @@ export const questionsApi = {
   },
 
   delete: async (id: string): Promise<void> => {
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) throw new Error('未登录');
+    const targetRowId = await resolveStoredQuestionRowId(id);
     if (isLocalDataApiMode()) {
       const token = await getAccessToken();
       await localDataApiFetch<{ data: { ok: true } }>(token, '/questions/delete', {
         method: 'POST',
-        body: JSON.stringify({ id }),
+        body: JSON.stringify({ id: targetRowId }),
       });
-      invalidateQuestionsCache();
-      statsApi.invalidateCache();
+      invalidateQuestionsCache(user.id);
+      statsApi.invalidateCache(user.id);
       invalidateAggregateQueries();
       return;
     }
     const { error } = await supabase
       .from('questions')
       .delete()
-      .eq('id', id);
+      .eq('id', targetRowId);
 
     if (error) throw new Error(error.message);
-    invalidateQuestionsCache();
-    statsApi.invalidateCache();
+    invalidateQuestionsCache(user.id);
+    statsApi.invalidateCache(user.id);
     invalidateAggregateQueries();
   },
 
@@ -1522,6 +2896,75 @@ export const questionsApi = {
   invalidateCache: (userId?: string) => {
     invalidateQuestionsCache(userId);
   },
+  checkSemanticDuplicate: async (pairs: SemanticDuplicatePairInput[]): Promise<SemanticDuplicatePairResult[]> => {
+    const normalizedPairs = (Array.isArray(pairs) ? pairs : [])
+      .map((pair) => ({
+        existingQuestionText: String(pair?.existingQuestionText || '').trim(),
+        incomingQuestionText: String(pair?.incomingQuestionText || '').trim(),
+      }))
+      .filter((pair) => pair.existingQuestionText.length > 0 && pair.incomingQuestionText.length > 0);
+    if (normalizedPairs.length === 0) return [];
+
+    const promptPayload = normalizedPairs.map((pair, index) => ({
+      index,
+      question_a: pair.existingQuestionText.slice(0, 1800),
+      question_b: pair.incomingQuestionText.slice(0, 1800),
+    }));
+    const userPrompt = [
+      '请判断以下题目对是否语义重复。',
+      '你必须返回 JSON 数组，禁止任何 Markdown 或多余说明。',
+      '数组每项必须是：{ "index": number, "is_duplicate": boolean, "confidence": number, "reason": string }。',
+      'confidence 范围 0~1，reason 不超过 50 字。',
+      JSON.stringify(promptPayload),
+    ].join('\n');
+
+    let fullContent = '';
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('AI语义查重超时，请重试')), 45000);
+      chatApi.streamChat(
+        [{ role: 'user', content: userPrompt }],
+        () => {},
+        (content) => {
+          clearTimeout(timer);
+          fullContent = content;
+          resolve();
+        },
+        (err) => {
+          clearTimeout(timer);
+          reject(new Error(err));
+        },
+        {
+          systemPrompt: '你是严谨的题目语义查重助手。只输出合法 JSON 数组，不输出任何其他文本。',
+        }
+      );
+    });
+
+    const jsonText = extractJsonArrayText(fullContent);
+    if (!jsonText) {
+      throw new Error('AI语义查重返回格式错误');
+    }
+    const parsed = JSON.parse(sanitizeJsonText(jsonText));
+    const rawList = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.results) ? parsed.results : []);
+    const resultMap = new Map<number, SemanticDuplicatePairResult>();
+    for (const row of rawList) {
+      const index = Number((row as any)?.index);
+      if (!Number.isFinite(index) || index < 0) continue;
+      const rawConfidence = Number((row as any)?.confidence);
+      const confidence = Number.isFinite(rawConfidence)
+        ? (rawConfidence > 1 ? Math.min(rawConfidence / 100, 1) : Math.max(rawConfidence, 0))
+        : 0;
+      resultMap.set(index, {
+        is_duplicate: Boolean((row as any)?.is_duplicate),
+        confidence,
+        reason: String((row as any)?.reason || '').trim(),
+      });
+    }
+    return normalizedPairs.map((_, index) => resultMap.get(index) || {
+      is_duplicate: false,
+      confidence: 0,
+      reason: '',
+    });
+  },
 
   generateVariants: async (
     subject: Subject,
@@ -1529,28 +2972,24 @@ export const questionsApi = {
     amount: number,
     strategy: '递进' | '随机' | '攻坚',
   ): Promise<{ variants: VariantQuestion[] }> => {
-    const prompt = `请作为专业教师，针对${subject}学科生成 ${amount} 道变式训练题。
-    ${nodes.length > 0 ? `考察的知识点为：${nodes.join('、')}。` : ''}
-    出题策略要求为：【${strategy}】（如果为“递进”，题目难度从易到难；如果为“随机”，难度随机；如果为“攻坚”，均为高难度题）。
-    
-    要求：
-    1. 题目必须完整，如果是阅读理解完形填空等，必须包含完整的文章或上下文。
-    2. 题干必须自洽，不能出现“根据短文/根据文章/What is the main idea of the passage”但未提供完整短文的情况。
-    3. 英语阅读类题目必须先给不少于 70 词的短文，再给题目与选项。
-    2. 返回格式必须是纯 JSON 数组，不要有任何额外的 Markdown 标记（不要包含 \`\`\`json 等）。
-    
-    JSON 格式如下：
-    [
-      {
-        "level": 1, // 难度层级 1-5
-        "question_type": "choice", // 必须是 "choice" (选择题) 或 "fill" (填空/解答题)
-        "question_text": "完整的题目内容（包含所需的文章、题干）",
-        "options": ["A. 选项1", "B. 选项2", "C. 选项3", "D. 选项4"], // 仅选择题需要，必须带字母前缀
-        "correct_answer": "A", // 单选填字母，填空解答填具体答案
-        "explanation": "详细的解题步骤和解析"
-      }
-    ]
-    `;
+    const request: GovernedGenerationRequest = {
+      proposalId: `legacy-${subject}-${strategy}-${amount}`,
+      subject,
+      nodes,
+      amount,
+      strategy,
+      sourceSurface: 'manual',
+      sourceReason: '兼容旧版生成入口',
+      objectiveCode: 'custom_scope',
+      explanationSummary: '兼容旧版专项练习出题请求',
+      successCriteria: `完成 ${amount} 题专项训练`,
+      generationPolicy: {
+        allowAiGenerate: true,
+        allowCache: false,
+        allowRuleFallback: false,
+      },
+    };
+    const prompt = buildGenerationPrompt(request, amount);
 
     let lastError: any;
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -1578,48 +3017,7 @@ export const questionsApi = {
           );
         });
         const parsed = parseGeneratedList(fullContent);
-        const variants: VariantQuestion[] = parsed.map((entry: any, idx: number) => {
-          const item = entry && typeof entry === 'object' ? entry as Record<string, any> : {};
-          const options = (Array.isArray(item.options) ? item.options : [])
-            .map((rawOption: any, optionIdx: number) => {
-              if (typeof rawOption === 'string') return rawOption.trim();
-              if (rawOption && typeof rawOption === 'object') {
-                const optionRecord = rawOption as Record<string, unknown>;
-                const textValue = typeof optionRecord.text === 'string' ? optionRecord.text.trim() : '';
-                if (textValue) {
-                  const rawLabel = typeof optionRecord.label === 'string' ? optionRecord.label : '';
-                  const label = rawLabel.match(/[A-H]/i)?.[0]?.toUpperCase() || String.fromCharCode(65 + optionIdx);
-                  return `${label}. ${textValue}`;
-                }
-                const pair = Object.entries(optionRecord).find(([, value]) => typeof value === 'string' && String(value).trim().length > 0);
-                if (pair) {
-                  const [key, value] = pair;
-                  const label = key.match(/[A-H]/i)?.[0]?.toUpperCase() || String.fromCharCode(65 + optionIdx);
-                  return `${label}. ${String(value).trim()}`;
-                }
-              }
-              return String(rawOption ?? '').trim();
-            })
-            .filter((value: string) => value.length > 0)
-            .map((value: string, optionIdx: number) => {
-              const label = String.fromCharCode(65 + optionIdx);
-              const text = value.replace(/^[A-H][\.．、:：\)）\]]\s*/i, '').trim();
-              return `${label}. ${text || value}`;
-            });
-          const rawType = item.question_type === 'choice' || item.question_type === 'fill'
-            ? item.question_type
-            : (item.questionType === 'choice' || item.questionType === 'fill' ? item.questionType : 'fill');
-          const question_type = rawType === 'choice' && options.length < 2 ? 'fill' : rawType;
-          return {
-            level: Number(item.level) > 0 ? Number(item.level) : (idx + 1),
-            question_type,
-            question_text: String(item.question_text || item.question || '题目加载失败'),
-            options: question_type === 'choice' ? options : [],
-            correct_answer: String(item.correct_answer || item.correctAnswer || ''),
-            acceptable_answers: [],
-            explanation: String(item.explanation || item.analysis || '暂无解析')
-          };
-        }).filter((item) => item.question_text.trim().length > 0 && shouldKeepGeneratedQuestion(item, subject));
+        const variants = normalizeGeneratedVariants(parsed, subject, 'ai');
         if (variants.length === 0) throw new Error('未生成可用题目');
         if (variants.length < Math.max(1, Math.ceil(amount * 0.6))) {
           throw new Error('题目质量不足，请重试');
@@ -1639,7 +3037,68 @@ export const questionsApi = {
     strategy: '递进' | '随机' | '攻坚',
     onBatch: (batch: VariantQuestion[], generated: number, total: number) => void,
   ): Promise<{ variants: VariantQuestion[] }> => {
+    return questionsApi.generateGovernedVariantsProgressive({
+      proposalId: `legacy-${subject}-${strategy}-${amount}`,
+      subject,
+      nodes,
+      amount,
+      strategy,
+      sourceSurface: 'manual',
+      sourceReason: '兼容旧版专项练习出题请求',
+      objectiveCode: 'custom_scope',
+      explanationSummary: '兼容旧版专项练习出题请求',
+      successCriteria: `完成 ${amount} 题专项训练`,
+      generationPolicy: {
+        allowAiGenerate: true,
+        allowCache: true,
+        allowRuleFallback: true,
+      },
+    }, onBatch).then((result) => ({ variants: result.variants }));
+  },
+  generateGovernedVariantsProgressive: async (
+    input: GovernedGenerationRequest,
+    onBatch: (batch: VariantQuestion[], generated: number, total: number) => void,
+  ): Promise<GovernedGenerationResult> => {
     const total = Math.max(1, amount);
+    const startedAt = Date.now();
+    const normalizedInput = {
+      ...input,
+      amount: Math.max(1, input.amount),
+      nodes: Array.from(new Set((input.nodes || []).map((item) => String(item || '').trim()).filter(Boolean))),
+    };
+    const cacheKey = getGenerationCacheKey(normalizedInput);
+    const cached = generationCache.get(cacheKey);
+    if (normalizedInput.generationPolicy.allowCache && cached && isCacheFresh(cached.timestamp, 30 * 60 * 1000)) {
+      const sliced = cached.value.variants.slice(0, normalizedInput.amount).map((item) => ({
+        ...item,
+        source_kind: 'cache',
+        source_label: '缓存复用',
+      }));
+      onBatch(sliced, sliced.length, normalizedInput.amount);
+      void submitBestEffortInsert('question_generation_telemetry', {
+        proposal_id: normalizedInput.proposalId,
+        source_surface: normalizedInput.sourceSurface,
+        source_reason: normalizedInput.sourceReason,
+        source_kind: 'cache',
+        quality: 'cache',
+        requested_amount: normalizedInput.amount,
+        accepted_amount: sliced.length,
+        rejected_amount: 0,
+        fallback_reason: null,
+        latency_ms: Date.now() - startedAt,
+      });
+      return {
+        variants: sliced,
+        effectiveAmount: sliced.length,
+        sourceKind: 'cache',
+        quality: 'cache',
+        validation: {
+          requested: normalizedInput.amount,
+          accepted: sliced.length,
+          rejected: 0,
+        },
+      };
+    }
     const all: VariantQuestion[] = [];
     const seen = new Set<string>();
     let failed = 0;
@@ -1653,7 +3112,7 @@ export const questionsApi = {
       const remain = total - all.length;
       const requestAmount = buildBatch(remain);
       try {
-        const { variants } = await questionsApi.generateVariants(subject, nodes, requestAmount, strategy);
+        const { variants } = await questionsApi.generateVariants(normalizedInput.subject, normalizedInput.nodes, requestAmount, normalizedInput.strategy);
         const accepted = variants
           .filter((item) => {
             const key = `${item.question_type}|${item.question_text.trim().toLowerCase()}`;
@@ -1676,8 +3135,72 @@ export const questionsApi = {
         break;
       }
     }
+    let sourceKind: GovernedGenerationResult['sourceKind'] = 'ai';
+    let quality: GovernedGenerationResult['quality'] = all.length >= normalizedInput.amount ? 'full' : 'partial';
+    let fallbackReason = '';
+    if (all.length === 0 && normalizedInput.generationPolicy.allowRuleFallback) {
+      const fallback = buildRuleFallbackVariants(normalizedInput, normalizedInput.amount);
+      fallback.forEach((item, index) => {
+        if (seen.has(`${item.question_type}|${item.question_text.trim().toLowerCase()}`)) return;
+        seen.add(`${item.question_type}|${item.question_text.trim().toLowerCase()}`);
+        all.push({ ...item, level: index + 1 });
+      });
+      if (all.length > 0) {
+        onBatch(all.slice(0, normalizedInput.amount), Math.min(all.length, normalizedInput.amount), normalizedInput.amount);
+        sourceKind = 'rule_fallback';
+        quality = 'fallback';
+        fallbackReason = 'ai_unavailable';
+      }
+    }
+    if (all.length > 0 && all.length < normalizedInput.amount && normalizedInput.generationPolicy.allowRuleFallback) {
+      const supplement = buildRuleFallbackVariants(normalizedInput, normalizedInput.amount - all.length);
+      const extra = supplement.filter((item) => {
+        const key = `${item.question_type}|${item.question_text.trim().toLowerCase()}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      }).slice(0, normalizedInput.amount - all.length);
+      if (extra.length > 0) {
+        all.push(...extra);
+        onBatch(extra, Math.min(all.length, normalizedInput.amount), normalizedInput.amount);
+        sourceKind = 'rule_fallback';
+        quality = all.length >= normalizedInput.amount ? 'fallback' : 'partial';
+        fallbackReason = fallbackReason || 'partial_ai_batch';
+      }
+    }
     if (all.length === 0) throw new Error('未生成可用题目，请稍后重试');
-    return { variants: all.slice(0, total) };
+    const variants = all.slice(0, normalizedInput.amount);
+    const result: GovernedGenerationResult = {
+      variants,
+      effectiveAmount: variants.length,
+      sourceKind,
+      quality,
+      fallbackReason: fallbackReason || undefined,
+      validation: {
+        requested: normalizedInput.amount,
+        accepted: variants.length,
+        rejected: Math.max(0, normalizedInput.amount - variants.length),
+      },
+    };
+    if (normalizedInput.generationPolicy.allowCache) {
+      generationCache.set(cacheKey, {
+        value: result,
+        timestamp: Date.now(),
+      });
+    }
+    void submitBestEffortInsert('question_generation_telemetry', {
+      proposal_id: normalizedInput.proposalId,
+      source_surface: normalizedInput.sourceSurface,
+      source_reason: normalizedInput.sourceReason,
+      source_kind: sourceKind,
+      quality,
+      requested_amount: normalizedInput.amount,
+      accepted_amount: variants.length,
+      rejected_amount: Math.max(0, normalizedInput.amount - variants.length),
+      fallback_reason: fallbackReason || null,
+      latency_ms: Date.now() - startedAt,
+    });
+    return result;
   },
 
   swipeReview: async (id: string, action: 'again' | 'hard' | 'easy'): Promise<Question> => {
@@ -1719,36 +3242,80 @@ export const questionsApi = {
   },
 
   submitReviewAttempt: async (input: SubmitReviewAttemptInput): Promise<SubmitReviewAttemptResult> => {
+    const cached = readWritebackLedger<SubmitReviewAttemptResult>(input.writebackContext?.idempotencyKey);
+    if (cached) return cached;
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) throw new Error('未登录');
+    const fallbackAction = input.rating === 'forgot' ? 'again' : input.rating === 'mastered' ? 'easy' : 'hard';
     if (isLocalDataApiMode()) {
       const token = await getAccessToken();
-      const response = await localDataApiFetch<{ data: { attempt_id?: string; next_review_date?: string; question: Question } }>(
-        token,
-        '/review/attempt',
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            questionId: input.questionId,
-            userAnswer: input.userAnswer,
-            isCorrect: input.isCorrect,
-            rating: input.rating,
-            correctAnswer: input.correctAnswer || null,
-            selectedOptionText: input.selectedOptionText || null,
-            diagnosis: input.diagnosis,
-          }),
-        },
-      );
-      invalidateQuestionsCache();
-      statsApi.invalidateCache();
-      invalidateAggregateQueries();
-      void queryClient.setQueryData(queryKeys.recentAttempts(input.questionId, 6), (previous: ReviewAttemptRecord[] | undefined) => {
-        if (!previous) return previous;
-        return previous.slice(0, 5);
-      });
-      return {
-        question: normalizeQuestionRow(response.data.question),
-        attemptId: response.data.attempt_id,
-        nextReviewDate: response.data.next_review_date || response.data.question?.next_review_date,
-      };
+      try {
+        const response = await localDataApiFetch<{ data: { attempt_id?: string; next_review_date?: string; question: Question } }>(
+          token,
+          '/review/attempt',
+          {
+            method: 'POST',
+            body: JSON.stringify({
+              questionId: input.questionId,
+              userAnswer: input.userAnswer,
+              isCorrect: input.isCorrect,
+              rating: input.rating,
+              correctAnswer: input.correctAnswer || null,
+              selectedOptionText: input.selectedOptionText || null,
+              diagnosis: input.diagnosis,
+            }),
+          },
+        );
+        invalidateQuestionsCache(user.id);
+        statsApi.invalidateCache(user.id);
+        invalidateAggregateQueries();
+        void queryClient.setQueryData(queryKeys.recentAttempts(input.questionId, 6), (previous: ReviewAttemptRecord[] | undefined) => {
+          if (!previous) return previous;
+          return previous.slice(0, 5);
+        });
+        const result = {
+          question: normalizeQuestionRow(response.data.question),
+          attemptId: response.data.attempt_id,
+          nextReviewDate: response.data.next_review_date || response.data.question?.next_review_date,
+        };
+        writeWritebackLedger(input.writebackContext?.idempotencyKey, result);
+        void questionsApi.submitLearningTelemetry({
+          eventType: 'review_writeback_committed',
+          proposalId: input.writebackContext?.proposalId,
+          sessionId: input.writebackContext?.sessionId,
+          sessionKind: 'review',
+          sourceSurface: input.writebackContext?.sourceSurface,
+          sourceReason: input.writebackContext?.sourceReason,
+          plannerSource: input.writebackContext?.plannerSource,
+          judgeMode: input.writebackContext?.judgeMode || 'server',
+          fallbackReason: input.writebackContext?.fallbackReason,
+          completionOutcome: input.isCorrect ? 'correct' : 'wrong',
+        });
+        return result;
+      } catch (error: any) {
+        const question = await questionsApi.swipeReview(input.questionId, fallbackAction).catch(() => {
+          throw error;
+        });
+        const result = {
+          question,
+          attemptId: undefined,
+          nextReviewDate: question.next_review_date,
+        };
+        writeWritebackLedger(input.writebackContext?.idempotencyKey, result);
+        void questionsApi.submitLearningTelemetry({
+          eventType: 'review_writeback_fallback',
+          proposalId: input.writebackContext?.proposalId,
+          sessionId: input.writebackContext?.sessionId,
+          sessionKind: 'review',
+          sourceSurface: input.writebackContext?.sourceSurface,
+          sourceReason: input.writebackContext?.sourceReason,
+          plannerSource: input.writebackContext?.plannerSource,
+          judgeMode: 'local',
+          fallbackReason: 'local_api_review_attempt_failed',
+          completionOutcome: input.isCorrect ? 'correct' : 'wrong',
+        });
+        return result;
+      }
     }
     const rpc = await supabase.rpc('submit_review_attempt', {
       p_question_id: input.questionId,
@@ -1761,7 +3328,6 @@ export const questionsApi = {
     });
     if (rpc.error) {
       if (isMissingFunctionError(rpc.error)) {
-        const fallbackAction = input.rating === 'forgot' ? 'again' : input.rating === 'mastered' ? 'easy' : 'hard';
         const question = await questionsApi.swipeReview(input.questionId, fallbackAction);
         let attemptId: string | undefined;
         try {
@@ -1790,11 +3356,25 @@ export const questionsApi = {
           }
         } catch {
         }
-        return {
+        const result = {
           question,
           attemptId,
           nextReviewDate: question.next_review_date,
         };
+        writeWritebackLedger(input.writebackContext?.idempotencyKey, result);
+        void questionsApi.submitLearningTelemetry({
+          eventType: 'review_writeback_fallback',
+          proposalId: input.writebackContext?.proposalId,
+          sessionId: input.writebackContext?.sessionId,
+          sessionKind: 'review',
+          sourceSurface: input.writebackContext?.sourceSurface,
+          sourceReason: input.writebackContext?.sourceReason,
+          plannerSource: input.writebackContext?.plannerSource,
+          judgeMode: 'local',
+          fallbackReason: 'missing_submit_review_attempt_rpc',
+          completionOutcome: input.isCorrect ? 'correct' : 'wrong',
+        });
+        return result;
       }
       throw new Error(rpc.error.message);
     }
@@ -1807,18 +3387,32 @@ export const questionsApi = {
     if (refetch.error || !refetch.data) {
       throw new Error(refetch.error?.message || '复习提交成功，但读取题目快照失败');
     }
-    invalidateQuestionsCache();
-    statsApi.invalidateCache();
+    invalidateQuestionsCache(user.id);
+    statsApi.invalidateCache(user.id);
     invalidateAggregateQueries();
     void queryClient.setQueryData(queryKeys.recentAttempts(input.questionId, 6), (previous: ReviewAttemptRecord[] | undefined) => {
       if (!previous) return previous;
       return previous.slice(0, 5);
     });
-    return {
+    const result = {
       question: normalizeQuestionRow(refetch.data),
       attemptId: rpcRow?.attempt_id,
       nextReviewDate: rpcRow?.next_review_date || refetch.data.next_review_date,
     };
+    writeWritebackLedger(input.writebackContext?.idempotencyKey, result);
+    void questionsApi.submitLearningTelemetry({
+      eventType: 'review_writeback_committed',
+      proposalId: input.writebackContext?.proposalId,
+      sessionId: input.writebackContext?.sessionId,
+      sessionKind: 'review',
+      sourceSurface: input.writebackContext?.sourceSurface,
+      sourceReason: input.writebackContext?.sourceReason,
+      plannerSource: input.writebackContext?.plannerSource,
+      judgeMode: input.writebackContext?.judgeMode || 'server',
+      fallbackReason: input.writebackContext?.fallbackReason,
+      completionOutcome: input.isCorrect ? 'correct' : 'wrong',
+    });
+    return result;
   },
 
   triggerPlanCacheRebuild: async (days = 14) => {
@@ -1839,7 +3433,7 @@ export const questionsApi = {
     }
   },
 
-  submitAiDiagnosisTelemetry: async (input: { questionId: string; status: 'success' | 'fallback' | 'error' | 'timeout'; latencyMs: number; errorMessage?: string }) => {
+  submitAiDiagnosisTelemetry: async (input: { questionId: string; status: 'success' | 'fallback' | 'error' | 'timeout'; latencyMs: number; errorMessage?: string; context?: LearningWritebackContext }) => {
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) return;
     if (!isValidUuid(input.questionId)) return;
@@ -1854,6 +3448,35 @@ export const questionsApi = {
     if (result.error && !isMissingRelationError(result.error)) {
       return;
     }
+    void questionsApi.submitLearningTelemetry({
+      eventType: 'review_diagnosis',
+      proposalId: input.context?.proposalId,
+      sessionId: input.context?.sessionId,
+      sessionKind: 'review',
+      sourceSurface: input.context?.sourceSurface,
+      sourceReason: input.context?.sourceReason,
+      plannerSource: input.context?.plannerSource,
+      judgeMode: input.context?.judgeMode,
+      fallbackReason: input.status === 'fallback' || input.status === 'timeout' ? input.errorMessage || input.status : undefined,
+      completionOutcome: input.status,
+    });
+  },
+
+  submitLearningTelemetry: async (input: LearningTelemetryEventInput) => {
+    await submitBestEffortInsert('learning_session_telemetry', {
+      event_type: input.eventType,
+      proposal_id: input.proposalId || null,
+      session_id: input.sessionId || null,
+      session_kind: input.sessionKind || null,
+      source_surface: input.sourceSurface || null,
+      source_reason: input.sourceReason || null,
+      planner_source: input.plannerSource || null,
+      judge_mode: input.judgeMode || null,
+      generation_quality: input.generationQuality || null,
+      fallback_reason: input.fallbackReason || null,
+      completion_outcome: input.completionOutcome || null,
+      metadata: input.metadata || {},
+    });
   },
 
   submitPerfTelemetry: async (input: { eventType: string; latencyMs: number }) => {
@@ -1943,6 +3566,183 @@ export const questionsApi = {
     }
     return (result.data || []) as ReviewAttemptRecord[];
   },
+
+  runPlannerShadow: async (input: { payload: PlannerInputPayload; ruleQueue: any[] }): Promise<PlanTelemetry | null> => {
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) throw new Error('未登录');
+    
+    let lastError: any = null;
+    const maxRetries = REVIEW_PLANNER_MAX_RETRIES;
+    
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), REVIEW_PLANNER_TIMEOUT_MS);
+      
+      try {
+        if (isLocalDataApiMode()) {
+          const token = await getAccessToken();
+          const response = await localDataApiFetch<{ data: PlanTelemetry | null }>(
+            token,
+            '/review/planner/shadow',
+            {
+              method: 'POST',
+              body: JSON.stringify(input),
+              signal: controller.signal,
+            }
+          );
+          clearTimeout(timeoutId);
+          return response.data || null;
+        }
+        // If not local api mode, we would call an edge function or RPC here.
+        // For now we will assume the local-api handles it or fallback gracefully.
+        clearTimeout(timeoutId);
+        return null;
+      } catch (err: any) {
+        clearTimeout(timeoutId);
+        lastError = err;
+        const isAbort = err.name === 'AbortError' || err.message?.includes('The user aborted a request');
+        console.warn(`[runPlannerShadow] Attempt ${attempt + 1} failed: ${isAbort ? 'Timeout' : err.message}`);
+        
+        if (attempt < maxRetries) {
+          // Wait before retrying
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+      }
+    }
+    
+    console.error(`[runPlannerShadow] All ${maxRetries + 1} attempts failed. Last error:`, lastError);
+    return null;
+  },
+  runReviewPlanner: async (input: ReviewPlannerRunInput): Promise<ReviewPlannerRunResult> => {
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) throw new Error('未登录');
+
+    const trimmedRuleQueue = input.rule_queue.slice(0, Math.max(1, input.budget_count));
+    const pageNumber = Math.max(1, Math.round(input.page_number || 1));
+    const payload = buildPlannerInputPayload(user.id, {
+      ...input,
+      page_number: pageNumber,
+      rule_queue: trimmedRuleQueue,
+    });
+    const strategyMeta = getReviewPlannerStrategyMeta(
+      input.scope,
+      trimmedRuleQueue,
+      input.due_min_ratio,
+    );
+    const rolloutMetadata = resolveReviewPlannerRollout({
+      plannerEnabled: reviewAiPlannerEnabled,
+      grayPercent: reviewAiGrayPercent,
+      seed: buildReviewPlannerGraySeed({
+        subject: input.subject,
+        scope: input.scope,
+        pageNumber,
+        questionIds: trimmedRuleQueue.map((item) => item.id),
+      }),
+      pageNumber,
+    });
+    let lastError: any = null;
+    let lastLatencyMs = 0;
+
+    const buildFallbackResult = (fallbackReason: string, reasons: string[]): ReviewPlannerRunResult => ({
+      request_id: payload.request_id,
+      plan_source: 'rule_fallback',
+      plan_version: `${buildReviewPlannerPlanVersion(strategyMeta.strategy_template)}-fallback`,
+      fallback_reason: fallbackReason,
+      planning_latency_ms: lastLatencyMs,
+      strategy_template: strategyMeta.strategy_template,
+      strategy_label: strategyMeta.strategy_label,
+      execution_queue: trimmedRuleQueue,
+      rule_queue: trimmedRuleQueue,
+      reasons,
+      comparison_summary: summarizePlannerComparison(trimmedRuleQueue, undefined, trimmedRuleQueue, [`fallback:${fallbackReason}`]),
+      risk_flags: {
+        strategy_template: strategyMeta.strategy_template,
+        strategy_label: strategyMeta.strategy_label,
+      },
+      rollout_metadata: rolloutMetadata,
+    });
+
+    if (isLocalDataApiMode()) {
+      const token = await getAccessToken();
+      const response = await localDataApiFetch<{ data: ReviewPlannerRunResult }>(
+        token,
+        '/review/planner/live',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            payload,
+            ruleQueue: trimmedRuleQueue,
+            strategyMeta: {
+              ...strategyMeta,
+              plan_version: buildReviewPlannerPlanVersion(strategyMeta.strategy_template),
+            },
+            rolloutMetadata,
+          }),
+        },
+      );
+      return {
+        ...response.data,
+        execution_queue: (response.data?.execution_queue || []).map(normalizeQuestionRow),
+        rule_queue: (response.data?.rule_queue || []).map(normalizeQuestionRow),
+      };
+    }
+
+    if (!rolloutMetadata.planner_enabled) {
+      const fallbackResult = buildFallbackResult('planner_disabled', ['AI Planner 当前已关闭，已直接切回规则队列']);
+      await persistPlannerTelemetry(user.id, payload, fallbackResult);
+      return fallbackResult;
+    }
+
+    if (!rolloutMetadata.selected) {
+      const fallbackResult = buildFallbackResult('gray_not_selected', ['当前会话未命中 AI 灰度，沿用规则队列']);
+      await persistPlannerTelemetry(user.id, payload, fallbackResult);
+      return fallbackResult;
+    }
+
+    for (let attempt = 0; attempt <= REVIEW_PLANNER_MAX_RETRIES; attempt += 1) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), REVIEW_PLANNER_TIMEOUT_MS);
+      const startedAt = Date.now();
+      try {
+        const plannerOutput = await requestLivePlannerOutput({
+          payload,
+          strategyMeta,
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+        lastLatencyMs = Date.now() - startedAt;
+        const result = applyPlannerGuardrails({
+          payload,
+          ruleQueue: trimmedRuleQueue,
+          plannerOutput,
+          strategyTemplate: strategyMeta.strategy_template,
+          strategyLabel: strategyMeta.strategy_label,
+          planningLatencyMs: lastLatencyMs,
+          rolloutMetadata,
+        });
+        await persistPlannerTelemetry(user.id, payload, result);
+        return result;
+      } catch (err: any) {
+        clearTimeout(timeoutId);
+        lastLatencyMs = Date.now() - startedAt;
+        lastError = err;
+        const isAbort = err?.name === 'AbortError' || err?.message?.includes('The user aborted a request');
+        console.warn(`[runReviewPlanner] Attempt ${attempt + 1} failed: ${isAbort ? 'Timeout' : err?.message || err}`);
+        if (attempt < REVIEW_PLANNER_MAX_RETRIES) {
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
+      }
+    }
+
+    const fallbackReason = lastError?.name === 'AbortError' || lastError?.message?.includes('The user aborted a request')
+      ? 'planner_timeout'
+      : String(lastError?.message || '').includes('planner_json_missing') || String(lastError?.message || '').includes('planner_queue_empty')
+        ? 'schema_invalid'
+        : 'request_failed';
+    const fallbackResult = buildFallbackResult(fallbackReason, ['AI 规划失败，已自动切回规则队列']);
+    await persistPlannerTelemetry(user.id, payload, fallbackResult);
+    return fallbackResult;
+  },
 };
 
 export const practiceApi = {
@@ -1952,6 +3752,7 @@ export const practiceApi = {
     nodes: string[];
     planned_amount: number;
     generated_amount: number;
+    writebackContext?: LearningWritebackContext;
   }) => {
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) throw new Error('未登录');
@@ -1980,7 +3781,18 @@ export const practiceApi = {
       if (isMissingRelationError(result.error)) return null;
       throw new Error(result.error.message);
     }
-    return result.data?.id || null;
+    const sessionId = result.data?.id || null;
+    void questionsApi.submitLearningTelemetry({
+      eventType: 'practice_session_started',
+      proposalId: input.writebackContext?.proposalId,
+      sessionId: sessionId || undefined,
+      sessionKind: 'practice',
+      sourceSurface: input.writebackContext?.sourceSurface,
+      sourceReason: input.writebackContext?.sourceReason,
+      generationQuality: input.writebackContext?.generationQuality,
+      completionOutcome: 'started',
+    });
+    return sessionId;
   },
   recordAttempt: async (input: {
     session_id: string;
@@ -1994,7 +3806,10 @@ export const practiceApi = {
     duration_seconds?: number;
     source_node?: string;
     ai_prompt_version?: string;
+    writebackContext?: LearningWritebackContext;
   }) => {
+    const cached = readWritebackLedger<{ ok: true }>(input.writebackContext?.idempotencyKey);
+    if (cached) return;
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) throw new Error('未登录');
     if (isLocalDataApiMode()) {
@@ -2003,6 +3818,7 @@ export const practiceApi = {
         method: 'POST',
         body: JSON.stringify(input),
       });
+      writeWritebackLedger(input.writebackContext?.idempotencyKey, { ok: true });
       return;
     }
     const result = await supabase
@@ -2015,6 +3831,7 @@ export const practiceApi = {
       if (isMissingRelationError(result.error)) return;
       throw new Error(result.error.message);
     }
+    writeWritebackLedger(input.writebackContext?.idempotencyKey, { ok: true });
   },
   abandonSession: async (sessionId: string) => {
     if (isLocalDataApiMode()) {
@@ -2053,13 +3870,17 @@ export const practiceApi = {
     source_node: string;
     ai_prompt_version: string;
     is_final: boolean;
+    writebackContext?: LearningWritebackContext;
   }) => {
+    const cached = readWritebackLedger<{ is_correct: boolean }>(input.writebackContext?.idempotencyKey);
+    if (cached) return cached;
     if (isLocalDataApiMode()) {
       const token = await getAccessToken();
       const response = await localDataApiFetch<{ data: { is_correct: boolean } }>(token, '/practice/attempts/submit', {
         method: 'POST',
         body: JSON.stringify(input),
       });
+      writeWritebackLedger(input.writebackContext?.idempotencyKey, response.data);
       return response.data;
     }
     const rpc = await supabase.rpc('submit_practice_attempt', {
@@ -2081,9 +3902,23 @@ export const practiceApi = {
     });
     if (rpc.error) throw new Error(rpc.error.message);
     const row = Array.isArray(rpc.data) ? rpc.data[0] : rpc.data;
-    return {
+    const result = {
       is_correct: Boolean(row?.is_correct),
     };
+    writeWritebackLedger(input.writebackContext?.idempotencyKey, result);
+    void questionsApi.submitLearningTelemetry({
+      eventType: 'practice_writeback_committed',
+      proposalId: input.writebackContext?.proposalId,
+      sessionId: input.session_id,
+      sessionKind: 'practice',
+      sourceSurface: input.writebackContext?.sourceSurface,
+      sourceReason: input.writebackContext?.sourceReason,
+      judgeMode: input.writebackContext?.judgeMode || 'server',
+      generationQuality: input.writebackContext?.generationQuality,
+      fallbackReason: input.writebackContext?.fallbackReason,
+      completionOutcome: result.is_correct ? 'correct' : 'wrong',
+    });
+    return result;
   },
 };
 
@@ -2211,7 +4046,8 @@ async function buildLocalStats(): Promise<Stats> {
 // ---- Stats ----
 export const statsApi = {
   get: async (): Promise<Stats> => {
-    const { data: { user } } = await supabase.auth.getUser();
+    const authResult = await supabase.auth.getUser();
+    const user = authResult?.data?.user;
     if (!user) throw new Error('未登录');
     const startedAt = Date.now();
     const localMode = isLocalDataApiMode();
@@ -2274,7 +4110,8 @@ export const statsApi = {
   },
 
   getCached: async (): Promise<Stats | null> => {
-    const { data: { user } } = await supabase.auth.getUser();
+    const authResult = await supabase.auth.getUser();
+    const user = authResult?.data?.user;
     if (!user) return null;
     const inMemory = statsCache.get(user.id);
     const persisted = inMemory || await readPersistentCache<Stats>('stats', getStatsCacheKey(user.id));
@@ -2312,6 +4149,7 @@ export async function buildCopilotLearningProfile(
 ): Promise<string> {
   const maxSamples = options.maxSamples && options.maxSamples > 0 ? options.maxSamples : 8;
   try {
+    await hydrateTagDictionaryOnce();
     const [questions, weaknesses, userState] = await Promise.all([
       questionsApi.getAll({ sortBy: 'latestWrong' }, { forceRefresh: true }),
       weaknessApi.getAll({ forceRefresh: true }),
@@ -2325,34 +4163,39 @@ export async function buildCopilotLearningProfile(
     const createdThisWeek = questions.filter((item) => now - new Date(item.created_at).getTime() <= weekMs).length;
     const subjectCounter: Record<string, number> = {};
     const pointCounter: Record<string, number> = {};
-    const errorCounter: Record<string, number> = {};
     questions.forEach((item) => {
       const subject = item.subject || '未知科目';
       const point = item.knowledge_point || '未标注知识点';
-      const errorType = item.error_type || '未标注错因';
       subjectCounter[subject] = (subjectCounter[subject] || 0) + 1;
       pointCounter[point] = (pointCounter[point] || 0) + 1;
-      errorCounter[errorType] = (errorCounter[errorType] || 0) + 1;
     });
     const weaknessText = weaknesses
       .slice(0, 5)
-      .map((item) => `${item.knowledge_point}/${item.ability}(${item.error_count})`)
+      .map((item) => `${item.knowledge_point}(${item.error_count})`)
       .join('、');
     const sampleText = questions
       .slice(0, maxSamples)
       .map((item, index) => {
         const stem = (item.question_text || '').replace(/\s+/g, ' ').slice(0, 36);
         const mastery = item.mastery_level ?? Math.round((item.confidence ?? 0.5) * 100);
-        return `${index + 1}. [${item.subject}] ${item.knowledge_point}/${item.error_type} 掌握度${mastery} 题干:${stem}`;
+        return `${index + 1}. [ID:${item.id}] [${item.subject}] ${item.knowledge_point} 掌握度${mastery} 题干:${stem}`;
+      })
+      .join('\n');
+    const drawerByTag = userState?.learning_content?.drawerByTag || {};
+    const pointSummaryText = Object.entries(pointCounter)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 8)
+      .map(([point]) => {
+        const drawer = (drawerByTag as any)?.[point] || {};
+        const summary = String(drawer?.summary || '').replace(/\s+/g, ' ').slice(0, 120);
+        const markdown = String(drawer?.markdown || '').replace(/\s+/g, ' ').slice(0, 120);
+        return `${point}：总结=${summary || '暂无'}；补充=${markdown || '暂无'}`;
       })
       .join('\n');
       
     const customKp = userState?.tag_extensions?.knowledge_point || [];
-    const customEt = userState?.tag_extensions?.error_type || [];
     const allEnKp = [...getKnowledgePointsBySubject('英语'), ...customKp];
     const allCKp = [...getKnowledgePointsBySubject('C语言'), ...customKp];
-    const allEnEt = [...getErrorTypesBySubject('英语'), ...customEt];
-    const allCEt = [...getErrorTypesBySubject('C语言'), ...customEt];
 
     return `学习档案快照（系统提供，可信）：
 - 错题总数：${total}
@@ -2361,18 +4204,16 @@ export async function buildCopilotLearningProfile(
 - 近7天新增：${createdThisWeek}
 - 科目分布：${buildTopListText(subjectCounter, 6) || '暂无'}
 - 高频知识点：${buildTopListText(pointCounter, 10) || '暂无'}
-- 高频错因：${buildTopListText(errorCounter, 10) || '暂无'}
-- user_weakness高频：${weaknessText || '暂无'}
+- 主知识点高频统计：${weaknessText || '暂无'}
 - 最近错题样本：
 ${sampleText || '暂无'}
+- 知识点总结快照（用于避免重复、做增量优化）：
+${pointSummaryText || '暂无'}
 
 （重要）当前系统完整标签库（必须从中选择，切勿自己生造，系统会自动做模糊匹配）：
 - 科目：英语、C语言
 - 英语知识点：${allEnKp.join('、')}
 - C语言知识点：${allCKp.join('、')}
-- 能力维度：${ABILITIES.join('、')}
-- 英语错因：${allEnEt.join('、')}
-- C语言错因：${allCEt.join('、')}
 
 请严格基于这份学习档案回答用户“弱点/错题分布/复习优先级”等问题；如果总数为0，再明确说明暂无错题数据。`;
   } catch (error) {
@@ -2381,7 +4222,8 @@ ${sampleText || '暂无'}
 }
 
 // ---- AI System Prompt ----
-const AI_SYSTEM_PROMPT = `你是一个学习分类系统，负责分析用户的错题。
+function buildAiSystemPrompt() {
+  return `你是一个学习分类系统，负责分析用户的错题。
 
 用户会提供题目（可能附带文字）和错误描述（"我哪里错了"）。
 请分析错题，并生成标准化错题卡片，格式如下（用<CARD>和</CARD>包裹，内容必须是合法JSON）：
@@ -2391,8 +4233,6 @@ const AI_SYSTEM_PROMPT = `你是一个学习分类系统，负责分析用户的
   "subject": "英语 或 C语言",
   "question_text": "完整题目内容",
   "knowledge_point": "必须从对应的知识点列表中选择最合适的一个",
-  "ability": "必须从能力维度列表中选择一个",
-  "error_type": "必须从错误原因列表中选择一个",
   "note": "非结构化补充说明，比如你的分析建议"
 }
 </CARD>
@@ -2401,63 +4241,79 @@ const AI_SYSTEM_PROMPT = `你是一个学习分类系统，负责分析用户的
 - 英语: ${getKnowledgePointsBySubject('英语').join(", ")}
 - C语言: ${getKnowledgePointsBySubject('C语言').join(", ")}
 
-能力维度：
-${ABILITIES.join(", ")}
-
-错误原因：
-- 英语: ${getErrorTypesBySubject('英语').join(", ")}
-- C语言: ${getErrorTypesBySubject('C语言').join(", ")}
-
 规则：
 1. 不允许用户选分类，AI强制结构化
-2. 只能从给定列表中选择，不允许新增分类，不允许使用“粗心/审题不清/不熟练”等泛化标签
+2. 只能从给定知识点列表中选择，不允许新增分类
 3. 始终用中文回复，语气友好专业
 4. JSON中不要有注释，确保是合法JSON格式
-5. note 必须写成“可解析的专业步骤”，严格按以下格式（每行一条）：
-   核心错因：一句话指出规则冲突
-   步骤1 题眼定位：必须引用题干中的具体词或结构
-   步骤2 规则匹配：写出对应语法/解题规则，不讲空话
-   步骤3 答案回扣：明确为什么该答案成立、其他类型为何不成立
-6. 禁止空泛措辞，如“需要严格按照定义”“一步步推导即可”“结合语境判断”等未落到本题证据的话`;
+5. note 必须高效、直击痛点，拒绝任何废话和死板套路。不需要硬性使用“步骤1/2/3”等固定模板，灵活根据错题情况组织，但必须包含核心信息：
+   - 考查知识点：明确本题考查的核心。
+   - 错因分析：直接指出为什么错，点出思维误区或规则冲突。
+   - 核心解析：根据题干关键信息（题眼词、关键代码等）直接给出推导逻辑和结论。
+6. 禁止空泛措辞，如“需要严格按照定义”“一步步推导即可”等未落到本题证据的话；禁止输出像“步骤二：规则匹配”这样机械化的废话标题。`;
+}
 
 const AI_COPILOT_PROMPT = `你是“全能AI学伴”，只能处理学习相关请求：错题解答、错题入库、复习建议、练习建议。
+你会在用户消息中收到“对用户展示的能力”和“当前内部模式”，必须优先遵守前台能力边界：录入整理只处理错题草稿、知识点整理与结构修订；讲解追问只处理讲解、比较、错因分析与追问；计划推荐只提供学习建议、范围判断与下一步安排；跳转启动只负责生成 handoff card 并跳转到正式页面。
+如果用户只是简单的打招呼（如“你好”、“在吗”等）或日常闲聊，请简短友好地回复，**不需要**进行深度思考，也**不需要**背诵规则或提及你的能力清单。
 
-输出规则：
+输出规则：             
 1. 先输出给用户看的中文讲解。
-2. 如果需要执行动作，必须在末尾输出 <ACTION>...</ACTION>，其中是合法JSON，且只包含以下type：
-   - create_mistake: 错题入库。payload必须包含: subject(如英语/C语言), question_text(题干), knowledge_point, ability, error_type, note, correct_answer(若有), explanation(若有)。如果是选择题，必须额外提供 options 数组（如 ["A. 选项1", "B. 选项2"]），并确保 question_text 纯净且不包含选项。若成功提取了文本和选项，你可以设置 "image_url": "" 来丢弃原始图片。
-   - update_tags: 更新错题标签或内容。如果是更新特定错题，payload 必须包含 question_id。
-   - start_review: 开始复习。payload必须包含: preset({ subject, scope(due/all), amount, sortBy(nearestDue/lowestMastery) })。
+2. 如果需要执行动作，必须在最末尾直接输出 <ACTION>...</ACTION>。注意：
+  - \`<ACTION>\` 标签必须在最外层，绝不能被 \` \`\`\`json \` 等 Markdown 代码块包裹！
+  - \`<ACTION>\` 内部必须是纯文本 JSON，绝不能带有 \` \\\`\\\`\\\`json \` 标记！
+  - JSON 字符串内的换行必须使用转义字符 \\n，绝对不要输出真实的换行符！
+  - 不要向用户展示任何执行动作的 JSON 代码。
+  - 允许的 type 如下：
+  - create_mistake: 生成待确认错题草稿，而不是直接执行入库。payload 可以是单题对象，也可以使用 questions 数组一次给出多题草稿。每道题都必须只给 1 个最终 knowledge_point，且 subject(如英语/C语言)、question_text(题干)、knowledge_point、note、correct_answer 必须完整。note 必须包含【考查知识点】【错因分析】【核心解析】三段；summary 可为空，不要强行给每题预置总结。不再需要 mistake_point。如果是选择题，必须额外提供 options 数组（如 ["A. 选项1", "B. 选项2"]），并确保 question_text 纯净且不包含选项。若成功提取了文本和选项，你可以设置 "image_url": "" 来丢弃原始图片。
+  - update_tags: 更新错题标签或内容。payload 必须包含 question_id，且 question_id 必须来自“最近错题样本”中的 ID。
+   - start_review: 开始复习。payload必须包含: preset({ subject(必须单一学科，禁止混合英语与C语言), strategy(due_rescue/stubborn_focus/unmastered_boost/custom), scope(due/all/unmastered/stubborn), amount(建议10-20), sortBy(nearestDue/lowestMastery/latestWrong) })。优先输出“分包任务”语义，用小任务包描述本轮计划。
    - start_drill: 专项练习。payload必须包含: preset({ subject, nodes(知识点数组), amount, strategy(递进/随机/攻坚) })。
-   - delete_mistake: 删除特定错题。payload 必须包含 question_id。
-   - update_learning_content
-3. 默认策略是“先建议再执行”，所以动作只产出建议，不表示已执行。
+  - delete_mistake: 删除特定错题。payload 必须包含 question_id，且 question_id 必须来自“最近错题样本”中的 ID。
+  - update_learning_content: 智能更新知识点的 Markdown 总结内容。必须采用“知识浓缩”策略：将新规律归并为结构化的高质量 Markdown。排版必须像高质量教材/手写笔记：先按主题分组，再按子知识点展开。使用 \`###\` 作为一级分组标题；当知识点体量较大（例如 C 语言-结构体）时，在组内继续使用 \`####\` 拆分子点（如定义语法、内存布局、访问方式、典型陷阱）。每个标题下用短横线 bullet(-) 写要点，不要空话。允许保留“### 易错规律”用于集中列坑点。不要强制“解题方法/判断线索”固定模板，要根据知识点本身自然分类。直接用你最好的总结重写并覆盖已有内容，保持 Markdown 简洁、结构化。当用户批量提供跨标签的知识点时，你可以返回一个 update_learning_content 动作，并在 payload.updates 中提供一个数组。如果是更新单个知识点，可以在 payload 中直接给出 node/tag 和 markdown。若能判断更新性质，额外提供 decision(skip/rewrite/create) 与 reason，帮助前端展示“无需更新 / 建议改写 / 建议新增”的说明。
+3. 默认策略是“先建议再执行”，所以动作只产出待确认草稿，不表示已执行。
 4. 高风险动作 risk 必须为 "high"。
 5. 仅学习域；若用户闲聊或越界，礼貌拒绝并引导到复习或练习动作。
-6. 当用户要求改写“提分锦囊”或“知识点抽屉”内容时，使用 update_learning_content，并在 payload 中给出 node/tag、tips、summary、tables。
-7. 你会收到“学习档案快照（系统提供，可信）”，必须优先依据该快照回答“我有哪些弱点/错题在哪些板块”。
-8. 只有当快照里“错题总数=0”时，才能说“暂无错题”；否则必须给出分布、Top弱点、优先复习建议。
-9. 若动作为 create_mistake 或 update_tags 且包含 note，note 必须采用“核心错因 + 步骤1/2/3”的结构化格式，并且每一步都必须引用本题证据词（如 by the time、starts、if 从句等）。
-10. 禁止输出模板化废话，优先给“题眼词 → 规则 → 答案”的高密度解析。
-11. 标签必须精确：knowledge_point、ability、error_type 必须从系统给定标签库中挑最贴近项，禁止新造泛化标签。
-12. 每次建议 create_mistake 或 update_tags 时，都要额外给出 update_learning_content 所需内容（node、summary、tips），用于沉淀该知识点方法论。
+6. 若当前能力不是跳转启动，禁止主动输出完整复习正文或完整专项练习正文；最多只保留轻量 CTA。若当前能力是计划推荐，也只给建议与理由，不直接创建正式会话。
+7. 当用户要求改写“提分锦囊”或“知识点抽屉”内容时，或者用户主动提供知识点要求记录时，使用 update_learning_content，并在 payload 中给出 node/tag、markdown，或者使用 updates 数组批量更新多个知识点。直接用你最好的总结重写并覆盖已有内容，保持 Markdown 简洁结构化。
+8. 你会收到“学习档案快照（系统提供，可信）”，必须优先依据该快照回答“我有哪些弱点/错题在哪些板块”。
+9. 只有当快照里“错题总数=0”时，才能说“暂无错题”；否则必须给出分布、Top弱点、优先复习建议。
+10. 若动作为 create_mistake 或 update_tags 且包含 note，note 必须采用高效简洁的结构，抛弃硬性的步骤1/2/3。每一点解析都必须引用本题证据词（如 by the time、starts、if 从句等）。
+11. 禁止输出模板化废话，优先给出“题眼/关键信息 → 规则 → 结论”的高密度解析。若生成 start_review，说明文案要写成“专项任务包/分包任务”，避免“全量一次做完”的措辞。
+12. 标签必须精确：knowledge_point、ability、error_type 必须从系统给定标签库中挑最贴近项；如果拿不准，也只能给出 1 个最接近的主知识点，不能同时输出多个最终知识点。
+13. 每次建议 create_mistake 或 update_tags 时，都要额外给出 update_learning_content 所需内容；但若本轮核心目标是入库错题，必须优先输出 create_mistake / update_tags，不要仅输出 update_learning_content。learning_updates 中若能判断更新性质，也额外补充 decision(skip/rewrite/create) 与 reason。
+14. 当修改知识点内容（update_learning_content）或总结错题时，请基于题干证据、错因与解析进行归纳，不依赖 mistake_point 字段。
+15. 若输出 update_learning_content，markdown 应面向“长期可维护的完整知识点结构”：同概念合并、跨题抽象、去重表达，避免“每题一段新增补充”。
+16. update_learning_content 的 payload 必须包含 markdown（或者 updates 数组），直接给出完整的、结构化的高质量 Markdown 内容，取代现有的知识点内容。
+17. Markdown 必须按子知识点（如“### 语法结构 / ### 适用场景 / ### 易错点”等）归类，用短横线 bullet(-) 罗列要点。禁止添加任何“这是知识点总结”之类冗余大标题；内容直接从知识点分类开始。
+18. 摒弃过去“每题一个新增错题沉淀”的追加模式。收到新错题时，请把新规律融入对应的结构化模块中，同类合并，去重去冗。
+19. 当用户对“待入库草稿”提出不满意/补充要求时，优先重新输出 create_mistake 来覆盖草稿，不要只给解释性文字；并保证每题 note 补齐。 
 
 ACTION JSON格式：
 <ACTION>
 {
   "type": "create_mistake",
   "risk": "low",
-  "title": "发现新错题📝",
-  "description": "请确认后执行",
+  "title": "错题与知识点入库",
+  "description": "已生成待确认错题草稿，并提取了知识点总结",
   "payload": {
-    "subject": "英语",
-    "question_text": "完整的题目...",
-    "options": ["A. xxx", "B. yyy"],
-    "image_url": "",
-    "knowledge_point": "时态",
-    "ability": "规则应用",
-    "error_type": "概念混淆",
-    "note": "核心错因：by the time + 一般现在时从句，主句需用将来完成时\n步骤1 题眼定位：题干出现 by the time，且从句是 starts（一般现在时）\n步骤2 规则匹配：表示“到将来某时之前已完成”，主句应用 will have done\n步骤3 答案回扣：应选 will have completed，其他时态不满足先完成关系"
+    "questions": [
+      {
+        "subject": "英语",
+        "question_text": "He ____ (work) here since 2010.",
+        "correct_answer": "has worked",
+        "knowledge_point": "时态",
+        "note": "【考查知识点】现在完成时\n【错因分析】忽略了 since\n【核心解析】since + 过去时间点，主句用现在完成时。"
+      }
+    ],
+    "learning_updates": [
+      {
+        "tag": "时态",
+        "decision": "rewrite",
+        "reason": "本题补充了 since + 过去时间点 的稳定判定线索，需要重写到时态笔记中",
+        "markdown": "### 现在完成时\n- 看到 since + 过去时间点，主句必选 has/have done。"
+      }
+    ]
   }
 }
 </ACTION>`;
@@ -2624,10 +4480,16 @@ export const chatApi = {
       onReasoningChunk?: (chunk: string) => void;
       systemPrompt?: string;
       model?: string;
+      signal?: AbortSignal;
     },
   ) => {
+    await hydrateTagDictionaryOnce();
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 45000);
+    if (options?.signal) {
+      options.signal.addEventListener('abort', () => controller.abort());
+    }
+    // Increase timeout to 120 seconds (120000ms) to accommodate long deep thinking times
+    const timeout = setTimeout(() => controller.abort(), 120000);
 
     try {
       const { data: { session } } = await supabase.auth.getSession();
@@ -2645,12 +4507,13 @@ export const chatApi = {
           "Authorization": `Bearer ${apiKey}`,
         },
         body: JSON.stringify({
-          model: options?.model || (import.meta as any).env?.VITE_QWEN_MODEL || 'qwen-max',
+          model: options?.model || (import.meta as any).env?.VITE_QWEN_MODEL || 'qwen3.5-plus',
           messages: [
-            { role: 'system', content: options?.systemPrompt || AI_SYSTEM_PROMPT },
+            { role: 'system', content: options?.systemPrompt || buildAiSystemPrompt() },
             ...messages
           ],
           stream: true,
+          ...(options?.enableThinking ? { enable_thinking: true } : {})
         }),
         signal: controller.signal,
       });
@@ -2711,7 +4574,7 @@ export const chatApi = {
     onChunk: (chunk: string, isReasoning?: boolean) => void,
     onComplete: (fullContent: string) => void,
     onError: (error: string) => void,
-    options?: { injectLearningProfile?: boolean; enableThinking?: boolean; onReasoningChunk?: (chunk: string) => void; model?: string }
+    options?: { injectLearningProfile?: boolean; enableThinking?: boolean; onReasoningChunk?: (chunk: string) => void; model?: string; signal?: AbortSignal }
   ) => {
     let finalSystemPrompt = AI_COPILOT_PROMPT;
     if (options?.injectLearningProfile !== false) {
@@ -2731,6 +4594,7 @@ export const chatApi = {
         },
         systemPrompt: finalSystemPrompt,
         model: options?.model,
+        signal: options?.signal,
       }
     );
   },

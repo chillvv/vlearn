@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import { ChevronDown, ChevronUp, Clock, Eye, EyeOff, Edit2, Trash2, RotateCcw, Archive, ArchiveRestore } from 'lucide-react';
-import { getSubjectColor, getErrorTagColor } from '../../lib/subjects';
+import { ChevronDown, ChevronUp, Clock, Eye, EyeOff, Edit2, Trash2, RotateCcw, Archive, ArchiveRestore, Sparkles } from 'lucide-react';
+import { getSubjectColor } from '../../lib/subjects';
 import type { Question } from '../../lib/types';
 import { Button } from '../ui/button';
 import { MistakeQuestionPreview } from './MistakeQuestionPreview';
@@ -10,37 +10,51 @@ interface QuestionCardProps {
   onDelete?: (id: string) => void;
   onEdit?: (q: Question) => void;
   onToggleArchive?: (q: Question) => void;
+  onAskQuestion?: (q: Question) => void;
   readonly?: boolean;
+  selectable?: boolean;
+  selected?: boolean;
+  onSelect?: (selected: boolean) => void;
 }
 
-export function QuestionCard({ question, onDelete, onEdit, onToggleArchive, readonly = false }: QuestionCardProps) {
+export function QuestionCard({ question, onDelete, onEdit, onToggleArchive, onAskQuestion, readonly = false, selectable = false, selected = false, onSelect }: QuestionCardProps) {
   const [expanded, setExpanded] = useState(false);
   const [showAnswer, setShowAnswer] = useState(false);
 
   const sc = getSubjectColor(question.subject);
-  const ec = getErrorTagColor(question.error_type);
   const archived = Boolean(question.is_archived || question.mastery_state === 'archived');
 
   return (
-    <div className={`rounded-2xl bg-card border transition-all duration-200 overflow-hidden ${expanded ? 'border-primary/30 shadow-md' : 'border-border hover:border-primary/20 hover:shadow-sm'}`}>
+    <div className={`rounded-2xl bg-card border transition-all duration-200 overflow-hidden ${expanded ? 'border-primary/30 shadow-md' : 'border-border hover:border-primary/20 hover:shadow-sm'} ${selected ? 'border-indigo-400 bg-indigo-50/20' : ''}`}>
       {/* Collapsed header */}
       <div
         className="p-5 cursor-pointer"
-        onClick={() => { setExpanded(!expanded); setShowAnswer(false); }}
+        onClick={() => {
+          if (selectable && onSelect) {
+            onSelect(!selected);
+          } else {
+            setExpanded(!expanded);
+            setShowAnswer(false);
+          }
+        }}
       >
         <div className="flex items-start gap-3">
+          {selectable && (
+            <div className="flex items-center justify-center pt-1" onClick={e => e.stopPropagation()}>
+              <input
+                type="checkbox"
+                checked={selected}
+                onChange={e => onSelect?.(e.target.checked)}
+                className="w-4 h-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-600 transition-colors cursor-pointer"
+              />
+            </div>
+          )}
           <div className={`flex-shrink-0 w-1 self-stretch rounded-full ${sc.dot}`} />
           <div className="flex-1 min-w-0">
             <div className="flex items-center justify-between gap-2 mb-2.5">
               <div className="flex items-center gap-1.5 flex-wrap">
                 <span className={`text-[11px] px-2 py-0.5 rounded-md font-semibold ${sc.bg} ${sc.text}`}>{question.subject}</span>
                 <span className="text-[11px] px-2 py-0.5 rounded-md font-medium bg-muted text-muted-foreground">{question.knowledge_point}</span>
-                <span className="text-[11px] px-2 py-0.5 rounded-md font-medium bg-secondary text-secondary-foreground">{question.ability}</span>
-                {question.error_type && (
-                  <span className={`text-[11px] px-2 py-0.5 rounded-md font-semibold ${ec.bg} ${ec.text}`}>
-                    {question.error_type}
-                  </span>
-                )}
               </div>
               <div className="flex items-center gap-1 flex-shrink-0">
                 {expanded ? <ChevronUp className="w-4 h-4 text-muted-foreground flex-shrink-0" /> : <ChevronDown className="w-4 h-4 text-muted-foreground flex-shrink-0" />}
@@ -72,13 +86,27 @@ export function QuestionCard({ question, onDelete, onEdit, onToggleArchive, read
             )}
 
             {!expanded && (
-              <div className="flex items-center gap-4 mt-3">
+              <div className="mt-3 flex items-center gap-3">
                 <span className="text-[11px] text-muted-foreground flex items-center gap-1">
                   <Clock className="w-3 h-3" />{new Date(question.created_at).toLocaleDateString()}
                 </span>
                 <span className="text-[11px] text-muted-foreground flex items-center gap-1">
                   <RotateCcw className="w-3 h-3" />复习 {question.review_count} 次
                 </span>
+                {!readonly && !selectable && onAskQuestion && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onAskQuestion(question);
+                    }}
+                    className="ml-auto h-7 rounded-full px-3 text-[11px] font-medium"
+                  >
+                    <Sparkles className="mr-1 h-3.5 w-3.5" />
+                    问这题
+                  </Button>
+                )}
               </div>
             )}
           </div>
@@ -91,8 +119,8 @@ export function QuestionCard({ question, onDelete, onEdit, onToggleArchive, read
           <div className="pt-4 space-y-4">
             
             {question.image_url && (
-              <div className="rounded-lg overflow-hidden border border-border">
-                <img src={question.image_url} alt="Question" className="max-w-full h-auto" />
+              <div className="rounded-lg overflow-hidden border border-border flex justify-center items-center min-h-[100px] bg-muted/30">
+                <img src={question.image_url} alt="Question" className="max-w-full h-auto" loading="lazy" decoding="async" />
               </div>
             )}
 
@@ -132,6 +160,20 @@ export function QuestionCard({ question, onDelete, onEdit, onToggleArchive, read
               </div>
               {!readonly && (
                 <div className="flex items-center gap-1">
+                  {onAskQuestion && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onAskQuestion(question);
+                      }}
+                      className="h-8 rounded-xl px-3 text-xs"
+                    >
+                      <Sparkles className="mr-1 h-3.5 w-3.5" />
+                      问这题
+                    </Button>
+                  )}
                   <Button
                     variant="ghost"
                     size="icon"

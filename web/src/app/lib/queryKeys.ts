@@ -30,6 +30,7 @@ export const queryKeys = {
   questionsList: (query: QuestionQuery = {}) => ['questions', 'list', normalizeQuestionQuery(query)] as const,
   questionsCount: (query: QuestionQuery = {}) => ['questions', 'count', normalizeQuestionQuery(query)] as const,
   questionsDueCount: (subject?: string) => ['questions', 'due-count', subject || 'all'] as const,
+  reviewChunks: (subject?: string) => ['review', 'chunks', subject || 'all'] as const,
   recentAttempts: (questionId?: string, limit = 6) => ['questions', 'recent-attempts', questionId || 'none', limit] as const,
   dashboardStats: () => ['dashboard', 'stats'] as const,
   knowledgeNodeMastery: (subject: string) => ['knowledge', 'node-mastery', subject] as const,

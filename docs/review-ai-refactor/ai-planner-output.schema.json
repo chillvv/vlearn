@@ -1,0 +1,144 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AI Planner Output Schema v1",
+  "type": "object",
+  "required": [
+    "request_id",
+    "plan_version",
+    "queue",
+    "mix",
+    "risk",
+    "confidence"
+  ],
+  "properties": {
+    "request_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "plan_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "queue": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/queueItem"
+      }
+    },
+    "mix": {
+      "$ref": "#/$defs/mix"
+    },
+    "risk": {
+      "$ref": "#/$defs/risk"
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    }
+  },
+  "$defs": {
+    "queueItem": {
+      "type": "object",
+      "required": [
+        "question_id",
+        "rank",
+        "reason",
+        "suggested_interval_days",
+        "priority_score",
+        "strategy"
+      ],
+      "properties": {
+        "question_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rank": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "suggested_interval_days": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "priority_score": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "strategy": {
+          "type": "string",
+          "enum": [
+            "rescue",
+            "reinforce",
+            "new",
+            "revisit"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "mix": {
+      "type": "object",
+      "required": [
+        "rescue",
+        "reinforce",
+        "new",
+        "revisit"
+      ],
+      "properties": {
+        "rescue": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "reinforce": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "new": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "revisit": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      },
+      "additionalProperties": true
+    },
+    "risk": {
+      "type": "object",
+      "required": [
+        "high_volatility",
+        "high_fatigue",
+        "missing_data"
+      ],
+      "properties": {
+        "high_volatility": {
+          "type": "boolean"
+        },
+        "high_fatigue": {
+          "type": "boolean"
+        },
+        "missing_data": {
+          "type": "boolean"
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

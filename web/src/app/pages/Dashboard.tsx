@@ -13,6 +13,7 @@ import {
 import { PieChart, Pie, Cell, ResponsiveContainer } from 'recharts';
 import { useAuth } from '../lib/auth';
 import { Skeleton } from '../components/ui/skeleton';
+import { buildLearningSessionNavigation, createLearningSessionProposal } from '../lib/learningSession';
 import { useDashboardStatsQuery } from '../queries/questions';
 
 export function Dashboard() {
@@ -103,6 +104,56 @@ export function Dashboard() {
   }, [stats]);
 
   const backlogHigh = (stats?.dueReviewCount ?? 0) >= 10;
+  const reviewEntry = useMemo(() => buildLearningSessionNavigation(createLearningSessionProposal({
+    sessionKind: 'review',
+    sourceSurface: 'dashboard',
+    sourceReason: '用户从首页进入今日复习计划',
+    objectiveCode: 'review_due',
+    explanationSummary: '从首页开始处理今日到期复习任务',
+    scope: {
+      subject: '英语',
+      amount: Math.max(10, stats?.dueReviewCount ?? 10),
+      reviewScope: 'due',
+      sortBy: 'nearestDue',
+    },
+    nextStepHint: {
+      kind: 'practice',
+      label: '完成后去专项补弱',
+      pathname: '/practice',
+      search: '',
+    },
+    returnPath: {
+      pathname: '/',
+      search: '',
+      label: '回到首页',
+    },
+  })), [stats?.dueReviewCount]);
+  const practiceEntry = useMemo(() => buildLearningSessionNavigation(createLearningSessionProposal({
+    sessionKind: 'practice',
+    sourceSurface: 'dashboard',
+    sourceReason: '用户从首页进入专项练习推荐任务',
+    objectiveCode: stats?.topWeakness?.knowledge_point ? 'weakness_reinforce' : 'custom_scope',
+    explanationSummary: stats?.topWeakness?.knowledge_point
+      ? `聚焦薄弱点「${stats.topWeakness.knowledge_point}」开始本轮专项训练`
+      : '从首页开始一轮专项训练',
+    scope: {
+      subject: '英语',
+      amount: 10,
+      nodes: stats?.topWeakness?.knowledge_point ? [stats.topWeakness.knowledge_point] : [],
+      strategy: stats?.topWeakness?.knowledge_point ? '攻坚' : '递进',
+    },
+    nextStepHint: {
+      kind: 'review',
+      label: '完成后去复习巩固',
+      pathname: '/review',
+      search: '',
+    },
+    returnPath: {
+      pathname: '/',
+      search: '',
+      label: '回到首页',
+    },
+  })), [stats?.topWeakness?.knowledge_point]);
 
   const cardBaseClass =
     'group rounded-3xl border border-white/70 bg-white/88 p-6 shadow-[0_20px_50px_-28px_rgba(15,23,42,0.22)] backdrop-blur-xl transition-all duration-300 hover:-translate-y-1.5 hover:shadow-[0_30px_65px_-28px_rgba(15,23,42,0.32)]';
@@ -126,14 +177,13 @@ export function Dashboard() {
                 className="group relative inline-flex cursor-pointer items-center gap-2 rounded-2xl bg-gradient-to-r from-violet-500 via-blue-500 to-cyan-400 px-6 py-3 text-sm font-semibold text-white shadow-[0_16px_34px_-16px_rgba(59,130,246,0.85)] transition-all duration-300 hover:-translate-y-0.5 hover:shadow-[0_20px_40px_-14px_rgba(79,70,229,0.9)]"
               >
                 <span className="absolute inset-0 rounded-2xl bg-[linear-gradient(120deg,transparent_35%,rgba(255,255,255,0.45)_50%,transparent_65%)] bg-[length:230%_100%] opacity-70 transition-all duration-700 group-hover:bg-[position:130%_0]" />
-                <Camera size={18} />
-                <span className="relative">✨ 拍照录入错题</span>
+                <span className="relative text-base drop-shadow-sm">📸</span>
+                <span className="relative">拍照录入错题</span>
               </Link>
               <Link
                 to="/draft-review"
                 className="inline-flex cursor-pointer items-center gap-2 rounded-2xl border border-slate-200 bg-white/90 px-5 py-3 text-sm font-medium text-slate-700 transition-all duration-300 hover:-translate-y-0.5 hover:border-slate-300 hover:shadow-[0_14px_28px_-18px_rgba(15,23,42,0.45)]"
               >
-                <Sparkles size={17} />
                 <span>✨ 唤起 AI 管家</span>
               </Link>
             </div>
@@ -165,11 +215,12 @@ export function Dashboard() {
               </div>
             </div>
             <Link
-              to="/review"
+              to={{ pathname: reviewEntry.pathname, search: reviewEntry.search }}
+              state={reviewEntry.state}
               className="mt-8 inline-flex cursor-pointer items-center justify-center gap-2 rounded-2xl bg-orange-500 px-5 py-3 text-sm font-semibold text-white shadow-[0_14px_30px_-18px_rgba(249,115,22,0.85)] transition-all duration-300 hover:-translate-y-0.5 hover:bg-orange-600 hover:shadow-[0_20px_34px_-18px_rgba(249,115,22,0.95)]"
             >
-              <Play size={16} />
-              ▶ 开始沉浸式复习
+              <span className="text-base drop-shadow-sm">▶️</span>
+              开始沉浸式复习
             </Link>
           </article>
 
@@ -181,7 +232,7 @@ export function Dashboard() {
                   AI 专属突破 Targeted Drill
                 </div>
                 <span className="inline-flex items-center gap-1 rounded-full bg-gradient-to-r from-violet-500 to-blue-500 px-2.5 py-1 text-xs font-semibold text-white">
-                  <Sparkles size={12} />
+                  <span className="text-[10px] leading-none">✨</span>
                   Pro
                 </span>
               </div>
@@ -194,11 +245,12 @@ export function Dashboard() {
               </div>
             </div>
             <Link
-              to="/practice"
+              to={{ pathname: practiceEntry.pathname, search: practiceEntry.search }}
+              state={practiceEntry.state}
               className="mt-8 inline-flex cursor-pointer items-center justify-center gap-2 rounded-2xl bg-slate-900 px-5 py-3 text-sm font-semibold text-white transition-all duration-300 hover:-translate-y-0.5 hover:bg-slate-800 hover:shadow-[0_20px_34px_-20px_rgba(15,23,42,0.75)]"
             >
-              <Rocket size={16} />
-              🚀 开启专属训练
+              <span className="text-base drop-shadow-sm">🚀</span>
+              开启专属训练
             </Link>
           </article>
         </section>
