@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate } from 'react-router';
+import { useNavigate, useSearchParams } from 'react-router';
 import { questionsApi, userLearningStateApi } from '../lib/api';
 import { getKnowledgePointsBySubject, type Question, type Subject } from '../lib/types';
-import { BookOpen, Sparkles, ArrowRight, Plus, Pencil, Trash2, X, Download, TriangleAlert } from 'lucide-react';
+import { Sparkles, ArrowRight, Plus, Pencil, Trash2, X, Download, TriangleAlert, Loader2 } from 'lucide-react';
 
-import { getKnowledgeNodeMeta, hydrateTaxonomyOverridesFromCloud, registerCustomKnowledgeTaxonomy, removeCustomKnowledgeTaxonomy, renameCustomKnowledgeTaxonomy, isKnowledgePointInSubjectTaxonomy } from '../lib/knowledgeTaxonomy';
+import { getKnowledgeNodeMeta, getKnowledgePointsBySubjectFromTaxonomy, hydrateTaxonomyOverridesFromCloud, registerCustomKnowledgeTaxonomy } from '../lib/knowledgeTaxonomy';
 import { approveNewTags, getTagExtensionsSnapshot, hydrateTagExtensionsFromCloud, removeTagExtension, renameTagExtension } from '../lib/copilot';
+import { moveNodeTag, renameNodeTag, syncDeleteCategory, syncDeleteNodeTag } from '../lib/tagTreeService';
 import { ReactSortable } from 'react-sortablejs';
 import { getLearningSyncSnapshot, subscribeLearningSyncSnapshot, type LearningSyncSnapshot } from '../lib/learningSyncStatus';
 import { toast } from 'sonner';
@@ -41,6 +42,8 @@ function formatDuration(ms: number) {
 
 const PERF_WARN_THRESHOLD_MS = 800;
 const PERF_EVENT_KEY = 'mistake_book_perf_events_v1';
+const MISTAKE_BOOK_SUBJECT_KEY = 'vlearn_mistake_book_subject';
+const MISTAKE_BOOK_CATEGORY_SORT_KEY = 'vlearn_mistake_book_category_sort_v1';
 
 type PerfEvent = {
   type: 'load' | 'tree' | 'batch';
@@ -135,23 +138,19 @@ function EditableTag({
   node, 
   buttonClasses, 
   onRename, 
-  onDelete, 
-  onDragStart 
+  onDelete
 }: { 
   node: string, 
   buttonClasses: string, 
   onRename: (newVal: string) => void, 
-  onDelete: () => void,
-  onDragStart: (e: React.DragEvent) => void
+  onDelete: () => void
 }) {
   const [editing, setEditing] = useState(false);
   const [val, setVal] = useState(node);
 
   return (
     <div 
-      draggable={!editing}
-      onDragStart={onDragStart}
-      className={`inline-flex items-center gap-1 pl-3 pr-1 py-1.5 rounded-xl border text-xs font-bold transition-all duration-200 shadow-sm ring-2 ring-indigo-400/50 ring-offset-1 ${editing ? 'cursor-text' : 'cursor-move'} ${buttonClasses}`}
+      className={`inline-flex items-center gap-1 pl-3 pr-1 py-1.5 rounded-xl border text-xs font-bold transition-all duration-200 shadow-sm ring-2 ring-blue-400/50 ring-offset-1 ${editing ? 'cursor-text' : 'cursor-grab active:cursor-grabbing'} ${buttonClasses}`}
     >
       {editing ? (
         <input 
@@ -166,18 +165,19 @@ function EditableTag({
           onKeyDown={e => {
             if (e.key === 'Enter') {
               e.currentTarget.blur();
+              if (val.trim() && val.trim() !== node) onRename(val.trim());
             } else if (e.key === 'Escape') {
               setVal(node);
               setEditing(false);
             }
           }}
-          className="bg-transparent outline-none text-xs font-bold"
-          style={{ width: `${Math.max(2, val.length * 1.2)}em` }}
+          className="w-auto max-w-[28rem] min-w-[6ch] bg-transparent text-xs font-bold outline-none"
+          style={{ width: `${Math.max(6, val.length + 2)}ch` }}
         />
       ) : (
         <span 
           onClick={() => setEditing(true)} 
-          className="py-0.5 hover:opacity-80"
+          className="py-0.5 whitespace-nowrap hover:opacity-80"
           title="点击编辑标签名称"
         >
           {node}
@@ -189,24 +189,106 @@ function EditableTag({
   );
 }
 
-function AddTagBox({ onAdd }: { onAdd: (tag: string) => void }) {
-  const [val, setVal] = useState('');
+function EditableCategoryTitle({
+  category,
+  onRename,
+}: {
+  category: string;
+  onRename: (nextValue: string) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [val, setVal] = useState(category);
+
+  useEffect(() => {
+    setVal(category);
+  }, [category]);
+
   return (
-    <div className="inline-flex items-center gap-1 pl-2.5 pr-3 py-1.5 rounded-xl border border-dashed border-indigo-300 bg-indigo-50/50 text-xs font-bold transition-all shadow-sm focus-within:ring-2 focus-within:ring-indigo-400/50 focus-within:bg-white hover:bg-white">
-      <Plus className="w-3.5 h-3.5 text-indigo-400" />
+    <div className="min-w-0 flex-1">
+      {editing ? (
+        <input
+          autoFocus
+          value={val}
+          onChange={(e) => setVal(e.target.value)}
+          onBlur={() => {
+            setEditing(false);
+            const nextValue = val.trim();
+            if (nextValue && nextValue !== category) onRename(nextValue);
+            else setVal(category);
+          }}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              e.currentTarget.blur();
+            } else if (e.key === 'Escape') {
+              setVal(category);
+              setEditing(false);
+            }
+          }}
+          className="h-8 max-w-full min-w-[8ch] rounded-lg border border-blue-200 bg-white px-2 text-xl font-bold text-gray-900 outline-none ring-2 ring-blue-200"
+          style={{ width: `min(100%, ${Math.max(8, val.length + 2)}ch)` }}
+        />
+      ) : (
+        <h2
+          onClick={() => setEditing(true)}
+          className="cursor-text rounded-md px-1 text-xl font-bold text-gray-900 hover:bg-blue-50 whitespace-normal break-all"
+          title="点击编辑大类名称"
+        >
+          {category}
+        </h2>
+      )}
+    </div>
+  );
+}
+
+function AddTagBox({ onAdd }: { onAdd: (tag: string) => Promise<void> | void }) {
+  const [val, setVal] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  
+  const handleConfirm = async () => {
+    const nextTag = val.trim();
+    if (!nextTag || submitting) return;
+    try {
+      setSubmitting(true);
+      await onAdd(nextTag);
+      setVal('');
+    } catch (error: any) {
+      toast.error(error?.message || '新增标签失败');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="inline-flex items-center gap-1 pl-2.5 pr-1 py-1.5 rounded-xl border border-dashed border-blue-300 bg-blue-50/50 text-xs font-bold transition-all shadow-sm focus-within:ring-2 focus-within:ring-blue-400/50 focus-within:bg-white hover:bg-white">
+      <Plus className="w-3.5 h-3.5 text-blue-400" />
       <input 
         value={val}
         onChange={e => setVal(e.target.value)}
         onKeyDown={e => {
-          if (e.key === 'Enter' && val.trim()) {
-            onAdd(val.trim());
-            setVal('');
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            void handleConfirm();
           }
         }}
         placeholder="新增标签..."
-        className="bg-transparent outline-none text-xs font-bold placeholder:text-indigo-300 placeholder:font-medium text-indigo-700 min-w-[60px]"
+        className="bg-transparent outline-none text-xs font-bold placeholder:text-blue-300 placeholder:font-medium text-blue-700 min-w-[60px]"
         style={{ width: val ? `${Math.max(4, val.length * 1.2)}em` : '60px' }}
       />
+      <button
+        onClick={() => void handleConfirm()}
+        disabled={!val.trim() || submitting}
+        className="ml-1 flex h-5 w-5 items-center justify-center rounded-md bg-blue-100 text-blue-600 transition-colors hover:bg-blue-500 hover:text-white disabled:cursor-not-allowed disabled:bg-blue-50 disabled:text-blue-300"
+        title="确认新增"
+      >
+        {submitting ? (
+          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+        ) : (
+          <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+          </svg>
+        )}
+      </button>
     </div>
   );
 }
@@ -215,63 +297,53 @@ type NodeMap = Record<string, Question[]>;
 type L2Map = Record<string, NodeMap>;
 type CategoryMap = Record<string, L2Map>;
 
-function AddL2Box({ category, subject, setTagVersion }: { category: string, subject: string, setTagVersion: React.Dispatch<React.SetStateAction<number>> }) {
-  const [bVal, setBVal] = useState('');
-  const [tVal, setTVal] = useState('');
+type NodeVisualStatus = 'red' | 'orange' | 'green';
 
-  const handleSave = async () => {
-    if (bVal.trim() && tVal.trim()) {
-      try {
-        await registerCustomKnowledgeTaxonomy(tVal.trim(), category, bVal.trim(), subject as any);
-        approveNewTags({ knowledge_point: [tVal.trim()] });
-        setTagVersion(v => v + 1);
-        setBVal('');
-        setTVal('');
-        toast.success('分类与标签已创建');
-      } catch(e:any) { toast.error(e.message); }
-    } else if (bVal.trim() || tVal.trim()) {
-      toast.error('分类名称和首个标签都必须填写');
+function resolveNodeVisualStatus(list: Question[]): { status: NodeVisualStatus; priority: number; pending: number } {
+  if (!list.length) {
+    return { status: 'green', priority: 3, pending: 0 };
+  }
+
+  const reviewedCount = list.filter(item => (item.review_count ?? 0) > 0).length;
+  const unreviewedCount = Math.max(0, list.length - reviewedCount);
+  const pending = list.filter(item => (item.mastery_level ?? 0) < 80).length;
+  const reviewedMasterySum = list.reduce((sum, item) => {
+    if ((item.review_count ?? 0) > 0) {
+      return sum + Math.max(0, Math.min(100, item.mastery_level ?? 0));
     }
-  };
+    return sum;
+  }, 0);
+  const reviewedAvgMastery = reviewedCount > 0 ? reviewedMasterySum / reviewedCount : null;
+  const unreviewedPenalty = unreviewedCount >= 6 ? 30 : unreviewedCount >= 4 ? 18 : unreviewedCount >= 2 ? 10 : unreviewedCount >= 1 ? 5 : 0;
+  const effectiveMastery = reviewedAvgMastery !== null ? reviewedAvgMastery - unreviewedPenalty : Math.max(20, 85 - unreviewedCount * 12);
 
-  return (
-    <div className="space-y-3 pt-2">
-      <div className="flex items-center gap-2">
-        <div className="inline-flex items-center gap-2 rounded-lg border-2 border-dashed border-indigo-200 bg-indigo-50/30 px-3 py-1 text-xs font-bold text-gray-500">
-          <Plus className="w-3.5 h-3.5 text-indigo-400" />
-          <input 
-            value={bVal}
-            onChange={e => setBVal(e.target.value)}
-            placeholder="新增分类名称..."
-            className="bg-transparent outline-none w-28 text-gray-700 placeholder:text-indigo-300"
-          />
-        </div>
-      </div>
-      <div className="flex flex-wrap gap-2.5 min-h-[40px] p-1.5 -m-1.5 rounded-xl border-2 border-transparent">
-        <div className="inline-flex items-center gap-1 pl-2.5 pr-3 py-1.5 rounded-xl border border-dashed border-indigo-300 bg-indigo-50/50 text-xs font-bold transition-all shadow-sm focus-within:ring-2 focus-within:ring-indigo-400/50 focus-within:bg-white hover:bg-white">
-          <Plus className="w-3.5 h-3.5 text-indigo-400" />
-          <input 
-            value={tVal}
-            onChange={e => setTVal(e.target.value)}
-            onKeyDown={e => {
-              if (e.key === 'Enter') {
-                handleSave();
-              }
-            }}
-            placeholder="输入首个标签后回车保存"
-            className="bg-transparent outline-none text-xs font-bold placeholder:text-indigo-300 placeholder:font-medium text-indigo-700 min-w-[140px]"
-            style={{ width: tVal ? `${Math.max(10, tVal.length * 1.2)}em` : '140px' }}
-          />
-        </div>
-      </div>
-    </div>
-  );
+  if (effectiveMastery < 55 || pending >= 6 || (reviewedCount === 0 && list.length >= 4)) {
+    return { status: 'red', priority: 1, pending };
+  }
+  if (effectiveMastery < 80 || pending > 0 || unreviewedCount > 0) {
+    return { status: 'orange', priority: 2, pending };
+  }
+  return { status: 'green', priority: 3, pending };
 }
 
 export function MistakeBookPage() {
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const queryClient = useQueryClient();
-  const [subject, setSubject] = useState<Subject>('英语');
+
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => {
+    const timer = setTimeout(() => setMounted(true), 100);
+    return () => clearTimeout(timer);
+  }, []);
+  
+  const [subject, setSubject] = useState<Subject>(() => {
+    const querySubject = searchParams.get('subject');
+    if (querySubject === 'C语言' || querySubject === '英语') return querySubject;
+    const cachedSubject = window.localStorage.getItem(MISTAKE_BOOK_SUBJECT_KEY);
+    if (cachedSubject === 'C语言' || cachedSubject === '英语') return cachedSubject;
+    return '英语';
+  });
   const [tagVersion, setTagVersion] = useState(0);
   const [syncSnapshot, setSyncSnapshot] = useState<LearningSyncSnapshot>(getLearningSyncSnapshot());
   const [timeNow, setTimeNow] = useState(Date.now());
@@ -288,6 +360,28 @@ export function MistakeBookPage() {
   });
   const insightNode = subject === '英语' ? '非谓语动词' : '指针';
   const warnSnapshotRef = useRef({ load: 0, tree: 0, batch: 0 });
+  const prevSubjectRef = useRef(subject);
+  const movingNodeTargetsRef = useRef<Set<string>>(new Set());
+
+  const handleSubjectChange = (newSubject: Subject) => {
+    if (newSubject === prevSubjectRef.current) return;
+    prevSubjectRef.current = newSubject;
+    window.localStorage.setItem(MISTAKE_BOOK_SUBJECT_KEY, newSubject);
+    const nextParams = new URLSearchParams(searchParams);
+    nextParams.set('subject', newSubject);
+    setSearchParams(nextParams, { replace: true });
+    setSubject(newSubject);
+  };
+
+  const urlSubject = searchParams.get('subject');
+  
+  useEffect(() => {
+    if ((urlSubject === 'C语言' || urlSubject === '英语') && urlSubject !== subject && urlSubject !== prevSubjectRef.current) {
+      prevSubjectRef.current = urlSubject;
+      window.localStorage.setItem(MISTAKE_BOOK_SUBJECT_KEY, urlSubject);
+      setSubject(urlSubject);
+    }
+  }, [urlSubject, subject]);
 
   // Inline edit states
   const [addingCategory, setAddingCategory] = useState(false);
@@ -305,10 +399,20 @@ export function MistakeBookPage() {
     } catch {}
     return {};
   });
+  const [categorySortConfig, setCategorySortConfig] = useState<Record<Subject, string[]>>(() => {
+    try {
+      const raw = window.localStorage.getItem(MISTAKE_BOOK_CATEGORY_SORT_KEY);
+      if (raw) return JSON.parse(raw);
+    } catch {}
+    return { 英语: [], C语言: [] };
+  });
 
   useEffect(() => {
     window.localStorage.setItem('vlearn_mistake_book_node_sort_v2', JSON.stringify(sortConfig));
   }, [sortConfig]);
+  useEffect(() => {
+    window.localStorage.setItem(MISTAKE_BOOK_CATEGORY_SORT_KEY, JSON.stringify(categorySortConfig));
+  }, [categorySortConfig]);
   const questionsQuery = useQuery({
     queryKey: queryKeys.questionsList({ subject }),
     queryFn: () => questionsApi.getAll({ subject }),
@@ -364,10 +468,17 @@ export function MistakeBookPage() {
   }
 
   const customKnowledgeTags = useMemo(() => {
-    const all = getTagExtensionsSnapshot().knowledge_point || [];
+    const taxonomyTags = getKnowledgePointsBySubjectFromTaxonomy(subject);
+    const questionTags = questions
+      .map((item) => String(item.knowledge_point || '').trim())
+      .filter(Boolean);
+    const extensionTags = (getTagExtensionsSnapshot().knowledge_point || [])
+      .map((item) => String(item || '').trim())
+      .filter(Boolean);
+    const all = Array.from(new Set([...taxonomyTags, ...questionTags, ...extensionTags]));
     const base = getKnowledgePointsBySubject(subject);
-    return all.filter(item => !base.includes(item) && isKnowledgePointInSubjectTaxonomy(subject, item));
-  }, [subject, tagVersion]);
+    return all.filter(item => !base.includes(item));
+  }, [questions, subject, tagVersion]);
 
   const treeSnapshot = useMemo(() => {
     const startedAt = performance.now();
@@ -397,6 +508,14 @@ export function MistakeBookPage() {
     };
   }, [questions, customKnowledgeTags, subject]);
   const treeData = treeSnapshot.map;
+  const orderedCategories = useMemo(() => {
+    const categories = Object.keys(treeData);
+    const savedOrder = categorySortConfig[subject] || [];
+    const savedSet = new Set(savedOrder);
+    const known = savedOrder.filter((name) => categories.includes(name));
+    const extra = categories.filter((name) => !savedSet.has(name));
+    return [...known, ...extra];
+  }, [treeData, categorySortConfig, subject]);
 
   useEffect(() => {
     if (lastLoadMs <= 0) return;
@@ -430,68 +549,17 @@ export function MistakeBookPage() {
 
   const [categoryToDelete, setCategoryToDelete] = useState<string | null>(null);
 
-  const executeMoveNodeTag = async (node: string, newCategory: string, newL2: string) => {
-    try {
-      const meta = getKnowledgeNodeMeta(subject as Subject, node);
-      if (meta.category === newCategory && meta.branch === newL2) return; // No change
-
-      const startedAt = performance.now();
-      await registerCustomKnowledgeTaxonomy(node, newCategory, newL2, subject);
-      
-      const affectedIds = questions.filter(item => item.knowledge_point === node).map(item => item.id);
-      if (affectedIds.length > 0) {
-        await questionsApi.batchUpdate(affectedIds, { knowledge_point: node, category: newCategory, ability: newL2, node: node });
-      }
-      setTagVersion(prev => prev + 1);
-      await refreshQuestions();
-      const duration = performance.now() - startedAt;
-      setLastBatchMs(duration);
-      toast.success(`「${node}」已移动到「${newL2}」`);
-    } catch (error: any) {
-      toast.error(error?.message || '移动失败');
-    }
-  };
-
-  const executeRenameL2 = async (category: string, oldL2: string, newL2: string) => {
-    if (!newL2 || oldL2 === newL2) return;
-    try {
-      const startedAt = performance.now();
-      
-      const affectedIds = questions.filter(item => {
-        const meta = getKnowledgeNodeMeta(subject as Subject, item.knowledge_point);
-        return meta.category === category && meta.branch === oldL2;
-      }).map(item => item.id);
-
-      const nodesInL2 = Object.keys(treeData[category]?.[oldL2] || {});
-      await Promise.all(nodesInL2.map(node => 
-        registerCustomKnowledgeTaxonomy(node, category, newL2, subject)
-      ));
-      
-      if (affectedIds.length > 0) {
-        await questionsApi.batchUpdate(affectedIds, { ability: newL2 });
-      }
-      
-      setTagVersion(prev => prev + 1);
-      await refreshQuestions();
-      const duration = performance.now() - startedAt;
-      setLastBatchMs(duration);
-      toast.success(`分类已重命名为「${newL2}」`);
-    } catch (error: any) {
-      toast.error(error?.message || '重命名失败');
-    }
-  };
-
   const executeRenameNodeTag = async (oldValue: string, nextValue: string) => {
     if (!nextValue || nextValue === oldValue) return;
     try {
       const startedAt = performance.now();
       renameTagExtension('knowledge_point', oldValue, nextValue);
-      await renameCustomKnowledgeTaxonomy(oldValue, nextValue, subject);
-      const affectedIds = questions.filter(item => item.knowledge_point === oldValue).map(item => item.id);
-      if (affectedIds.length > 0) {
-        const meta = getKnowledgeNodeMeta(subject as Subject, nextValue);
-        await questionsApi.batchUpdate(affectedIds, { knowledge_point: nextValue, category: meta.category, ability: meta.branch, node: meta.node });
-      }
+      await renameNodeTag({
+        subject,
+        oldValue,
+        nextValue,
+        questions,
+      });
       setTagVersion(prev => prev + 1);
       await refreshQuestions();
       const duration = performance.now() - startedAt;
@@ -523,11 +591,12 @@ export function MistakeBookPage() {
     void (async () => {
       try {
         const startedAt = performance.now();
-        await removeCustomKnowledgeTaxonomy(value, subject);
-        if (affectedIds.length > 0) {
-          const meta = getKnowledgeNodeMeta(subject as Subject, fallback as string);
-          await questionsApi.batchUpdate(affectedIds, { knowledge_point: fallback as string, category: meta.category, ability: meta.branch, node: meta.node });
-        }
+        await syncDeleteNodeTag({
+          subject,
+          value,
+          fallback: fallback as string,
+          questions,
+        });
         await refreshQuestions();
         setLastBatchMs(performance.now() - startedAt);
       } catch (error: any) {
@@ -569,14 +638,12 @@ export function MistakeBookPage() {
     void (async () => {
       try {
         const startedAt = performance.now();
-        await Promise.all(
-          nodesToDelete.map(node => removeCustomKnowledgeTaxonomy(node, subject))
-        );
-
-        if (affectedIds.length > 0) {
-          const meta = getKnowledgeNodeMeta(subject as Subject, fallback as string);
-          await questionsApi.batchUpdate(affectedIds, { knowledge_point: fallback as string, category: meta.category, ability: meta.branch, node: meta.node });
-        }
+        await syncDeleteCategory({
+          subject,
+          nodesToDelete,
+          fallback: fallback as string,
+          questions,
+        });
 
         await refreshQuestions();
         setLastBatchMs(performance.now() - startedAt);
@@ -584,6 +651,82 @@ export function MistakeBookPage() {
         toast.error(`后台同步删除大类失败: ${error?.message || '未知错误'}`);
       }
     })();
+  };
+  const executeMoveNodeTag = async (nodeValue: string, targetCategory: string) => {
+    const normalizedNode = String(nodeValue || '').trim();
+    const normalizedTargetCategory = String(targetCategory || '').trim();
+    if (!normalizedNode || !normalizedTargetCategory) return;
+    const movingKey = `${subject}::${normalizedNode}::${normalizedTargetCategory}`;
+    if (movingNodeTargetsRef.current.has(movingKey)) return;
+    const meta = getKnowledgeNodeMeta(subject as Subject, normalizedNode);
+    if (meta.category === normalizedTargetCategory) return;
+    try {
+      movingNodeTargetsRef.current.add(movingKey);
+      await moveNodeTag({
+        subject,
+        nodeValue: normalizedNode,
+        targetCategory: normalizedTargetCategory,
+        questions,
+      });
+      setTagVersion((prev) => prev + 1);
+      await refreshQuestions();
+      toast.success(`标签「${normalizedNode}」已移动到「${normalizedTargetCategory}」`);
+    } catch (error: any) {
+      toast.error(error?.message || '移动标签失败');
+    } finally {
+      movingNodeTargetsRef.current.delete(movingKey);
+    }
+  };
+
+  const executeRenameCategory = async (oldCategory: string, nextCategory: string) => {
+    const normalizedOld = String(oldCategory || '').trim();
+    const normalizedNext = String(nextCategory || '').trim();
+    if (!normalizedOld || !normalizedNext || normalizedOld === normalizedNext) return;
+    if (treeData[normalizedNext]) {
+      toast.error(`大类「${normalizedNext}」已存在`);
+      return;
+    }
+    const l2Map = treeData[normalizedOld] || {};
+    const nodeNames = Object.values(l2Map).flatMap((nodes) => Object.keys(nodes));
+    if (nodeNames.length === 0) {
+      toast.error('当前大类下没有可重命名的标签');
+      return;
+    }
+    try {
+      const startedAt = performance.now();
+      await Promise.all(nodeNames.map((nodeName) => {
+        const meta = getKnowledgeNodeMeta(subject as Subject, nodeName);
+        return registerCustomKnowledgeTaxonomy(nodeName, normalizedNext, meta.branch || '默认分类', subject);
+      }));
+      const affectedIds = questions
+        .filter((item) => getKnowledgeNodeMeta(subject as Subject, item.knowledge_point).category === normalizedOld)
+        .map((item) => item.id);
+      if (affectedIds.length > 0) {
+        await questionsApi.batchUpdate(affectedIds, { category: normalizedNext });
+      }
+      setSortConfig((prev) => {
+        const next = { ...prev };
+        Object.keys(prev).forEach((key) => {
+          const oldPrefix = `${subject}-${normalizedOld}-`;
+          if (key.startsWith(oldPrefix)) {
+            const renamedKey = `${subject}-${normalizedNext}-${key.slice(oldPrefix.length)}`;
+            next[renamedKey] = prev[key];
+            delete next[key];
+          }
+        });
+        return next;
+      });
+      setCategorySortConfig((prev) => ({
+        ...prev,
+        [subject]: (prev[subject] || []).map((name) => (name === normalizedOld ? normalizedNext : name)),
+      }));
+      setTagVersion((v) => v + 1);
+      await refreshQuestions();
+      setLastBatchMs(performance.now() - startedAt);
+      toast.success(`大类已重命名为「${normalizedNext}」`);
+    } catch (error: any) {
+      toast.error(error?.message || '重命名大类失败');
+    }
   };
 
   const handleExportWeeklyReport = () => {
@@ -666,7 +809,7 @@ export function MistakeBookPage() {
             </span>
             <button
               onClick={handleExportWeeklyReport}
-              className="ml-1 inline-flex items-center gap-1 rounded-full bg-indigo-50 px-2.5 py-1 text-[11px] font-bold text-indigo-700 hover:bg-indigo-100 transition-all active:scale-95"
+              className="ml-1 inline-flex items-center gap-1 rounded-full bg-blue-50 px-2.5 py-1 text-[11px] font-bold text-blue-700 hover:bg-blue-100 transition-all active:scale-95"
               title="导出近7天性能周报"
             >
               <Download className="w-3 h-3" />
@@ -681,8 +824,8 @@ export function MistakeBookPage() {
             onClick={() => setIsGlobalEditing(!isGlobalEditing)}
             className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-2 text-sm font-bold shadow-sm transition-all ${
               isGlobalEditing 
-                ? 'bg-indigo-50 border-indigo-200 text-indigo-700 hover:bg-indigo-100' 
-                : 'bg-white border-gray-200 text-gray-700 hover:border-indigo-300 hover:text-indigo-600'
+                ? 'bg-blue-50 border-blue-200 text-blue-700 hover:bg-blue-100' 
+                : 'bg-white border-gray-200 text-gray-700 hover:border-blue-300 hover:text-blue-600'
             }`}
           >
             <Pencil className="h-4 w-4" />
@@ -694,7 +837,7 @@ export function MistakeBookPage() {
               setAddingCategory(true);
               setErrorTriggered(false);
             }}
-            className="inline-flex items-center gap-1.5 rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm font-bold text-gray-700 shadow-sm hover:border-indigo-300 hover:text-indigo-600 transition-all"
+            className="inline-flex items-center gap-1.5 rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm font-bold text-gray-700 shadow-sm hover:border-blue-300 hover:text-blue-600 transition-all"
           >
             <Plus className="h-4 w-4" />
             新增大类
@@ -703,17 +846,17 @@ export function MistakeBookPage() {
       </div>
 
       {addingCategory && (
-        <article className="space-y-6 rounded-3xl border-2 border-dashed border-indigo-200 bg-indigo-50/30 p-5 shadow-sm sm:p-6 animate-in fade-in zoom-in-95">
-          <div className="flex items-center justify-between border-b border-indigo-100/50 pb-4">
+        <article className="space-y-6 rounded-3xl border-2 border-dashed border-blue-200 bg-blue-50/30 p-5 shadow-sm sm:p-6 animate-in fade-in zoom-in-95">
+          <div className="flex items-center justify-between border-b border-blue-100/50 pb-4">
             <div className="flex items-center gap-3">
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-indigo-100 text-indigo-500">
+              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-blue-100 text-blue-500">
                 <Plus className="h-5 w-5" />
               </div>
               <input 
                 value={newCatName} 
                 onChange={e=>setNewCatName(e.target.value)} 
                 placeholder="输入大类名称..." 
-                className={`bg-transparent text-xl font-bold text-gray-900 outline-none placeholder:text-indigo-300 placeholder:font-medium border-b border-transparent focus:border-indigo-300 transition-colors ${newCatName.trim() === '' && errorTriggered ? 'border-rose-300 placeholder:text-rose-300' : ''}`}
+                className={`bg-transparent text-xl font-bold text-gray-900 outline-none placeholder:text-blue-300 placeholder:font-medium border-b border-transparent focus:border-blue-300 transition-colors ${newCatName.trim() === '' && errorTriggered ? 'border-rose-300 placeholder:text-rose-300' : ''}`}
               />
             </div>
             <button onClick={() => setAddingCategory(false)} className="text-gray-400 hover:text-gray-600"><X className="w-5 h-5"/></button>
@@ -721,24 +864,25 @@ export function MistakeBookPage() {
           
           <div className="space-y-3">
             <div className="flex items-center gap-2">
-              <div className="inline-flex items-center gap-2 rounded-lg border-2 border-dashed border-indigo-200 bg-white px-3 py-1 text-xs font-bold text-gray-500">
-                <Plus className="w-3.5 h-3.5 text-indigo-400" />
+              <div className="inline-flex items-center gap-2 rounded-lg border-2 border-dashed border-blue-200 bg-white px-3 py-1 text-xs font-bold text-gray-500">
+                <Plus className="w-3.5 h-3.5 text-blue-400" />
                 <input 
                   value={newBranchName} 
                   onChange={e=>setNewBranchName(e.target.value)} 
                   placeholder="输入分类名称..."
-                  className={`bg-transparent outline-none w-28 text-gray-700 placeholder:text-indigo-300 ${newBranchName.trim() === '' && errorTriggered ? 'placeholder:text-rose-300' : ''}`}
+                  className={`bg-transparent outline-none w-28 text-gray-700 placeholder:text-blue-300 ${newBranchName.trim() === '' && errorTriggered ? 'placeholder:text-rose-300' : ''}`}
                 />
               </div>
             </div>
             <div className="flex flex-wrap gap-2.5 min-h-[40px] p-1.5 -m-1.5 rounded-xl border-2 border-transparent">
-              <div className="inline-flex items-center gap-1 pl-2.5 pr-3 py-1.5 rounded-xl border border-dashed border-indigo-300 bg-white text-xs font-bold transition-all shadow-sm focus-within:ring-2 focus-within:ring-indigo-400/50">
-                <Plus className="w-3.5 h-3.5 text-indigo-400" />
+              <div className="inline-flex items-center gap-1 pl-2.5 pr-1 py-1.5 rounded-xl border border-dashed border-blue-300 bg-white text-xs font-bold transition-all shadow-sm focus-within:ring-2 focus-within:ring-blue-400/50">
+                <Plus className="w-3.5 h-3.5 text-blue-400" />
                 <input 
                   value={newTagName} 
                   onChange={e=>setNewTagName(e.target.value)} 
                   onKeyDown={async (e) => {
                     if (e.key === 'Enter') {
+                      e.preventDefault();
                       if(newCatName.trim() && newBranchName.trim() && newTagName.trim()) {
                         try {
                           await registerCustomKnowledgeTaxonomy(newTagName.trim(), newCatName.trim(), newBranchName.trim(), subject);
@@ -756,8 +900,34 @@ export function MistakeBookPage() {
                     }
                   }}
                   placeholder="输入首个标签后回车保存"
-                  className={`bg-transparent outline-none text-xs font-bold placeholder:text-indigo-300 placeholder:font-medium text-indigo-700 min-w-[150px] ${newTagName.trim() === '' && errorTriggered ? 'placeholder:text-rose-300' : ''}`}
+                  className={`bg-transparent outline-none text-xs font-bold placeholder:text-blue-300 placeholder:font-medium text-blue-700 min-w-[150px] ${newTagName.trim() === '' && errorTriggered ? 'placeholder:text-rose-300' : ''}`}
                 />
+                {newTagName.trim() && (
+                  <button
+                    onClick={async () => {
+                      if(newCatName.trim() && newBranchName.trim() && newTagName.trim()) {
+                        try {
+                          await registerCustomKnowledgeTaxonomy(newTagName.trim(), newCatName.trim(), newBranchName.trim(), subject);
+                          approveNewTags({ knowledge_point: [newTagName.trim()] });
+                          setTagVersion(v => v + 1);
+                          toast.success('大类与标签已创建');
+                          setAddingCategory(false);
+                          setNewCatName(''); setNewBranchName(''); setNewTagName('');
+                          setErrorTriggered(false);
+                        } catch (err: any) { toast.error(err.message); }
+                      } else {
+                        setErrorTriggered(true);
+                        toast.error('请填写完整的大类、分类和标签名称');
+                      }
+                    }}
+                    className="ml-1 flex h-5 w-5 items-center justify-center rounded-md bg-blue-100 text-blue-600 hover:bg-blue-500 hover:text-white transition-colors"
+                    title="确认创建"
+                  >
+                    <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                    </svg>
+                  </button>
+                )}
               </div>
             </div>
           </div>
@@ -784,7 +954,7 @@ export function MistakeBookPage() {
                 strokeWidth="8"
                 fill="none"
                 strokeDasharray="264"
-                strokeDashoffset={264 - (264 * overallMastery) / 100}
+                strokeDashoffset={264 - (264 * (mounted ? overallMastery : 0)) / 100}
                 className="transition-all duration-1000 ease-out"
                 strokeLinecap="round"
               />
@@ -840,7 +1010,7 @@ export function MistakeBookPage() {
             <button
               key={item}
               type="button"
-              onClick={() => setSubject(item)}
+              onClick={() => handleSubjectChange(item)}
               className={`rounded-xl px-5 py-2.5 text-sm font-bold transition-all duration-300 active:scale-95 sm:px-8 ${
                 subject === item 
                   ? 'bg-white text-gray-900 shadow-[0_2px_8px_-2px_rgba(0,0,0,0.08)]' 
@@ -854,8 +1024,25 @@ export function MistakeBookPage() {
       </section>
 
       {/* 3. Core Knowledge Tree Cards */}
-      <section className="grid gap-4 sm:gap-6 lg:grid-cols-2 2xl:grid-cols-3">
-        {Object.entries(treeData).map(([category, l2Map]) => {
+      <section>
+        <ReactSortable
+          list={orderedCategories.map((category) => ({ id: category }))}
+          setList={(nextState) => {
+            if (!isGlobalEditing) return;
+            setCategorySortConfig((prev) => ({
+              ...prev,
+              [subject]: nextState.map((item) => item.id),
+            }));
+          }}
+          animation={300}
+          easing="cubic-bezier(0.25, 1, 0.5, 1)"
+          ghostClass="opacity-40"
+          dragClass="scale-[1.01]"
+          disabled={!isGlobalEditing}
+          className="grid items-stretch gap-4 sm:gap-6 lg:grid-cols-2 2xl:grid-cols-3"
+        >
+        {orderedCategories.map((category) => {
+          const l2Map = treeData[category] || {};
           const catItems = Object.values(l2Map).flatMap(nodes => Object.values(nodes).flat());
           const catMasteryRaw = catItems.length > 0
             ? Math.round(catItems.reduce((sum, item) => sum + (item.mastery_level ?? 0), 0) / catItems.length)
@@ -864,13 +1051,20 @@ export function MistakeBookPage() {
           const catMastery = hasCatMastery ? Math.max(0, Math.min(100, catMasteryRaw)) : 0;
 
           return (
-            <article key={category} className="space-y-6 rounded-3xl border border-gray-200 bg-white p-5 shadow-[0_4px_20px_-4px_rgba(0,0,0,0.03)] transition-all duration-300 hover:shadow-[0_8px_24px_-4px_rgba(0,0,0,0.06)] hover:border-slate-200/80 sm:p-6">
+            <article key={category} className="flex h-full flex-col space-y-6 rounded-3xl border border-gray-200 bg-white p-5 shadow-[0_4px_20px_-4px_rgba(0,0,0,0.03)] transition-all duration-300 hover:shadow-[0_8px_24px_-4px_rgba(0,0,0,0.06)] hover:border-slate-200/80 sm:p-6">
               <div className="flex items-center justify-between border-b border-gray-100 pb-4 group/category">
                 <div className="flex items-center gap-3">
                   <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-blue-50/80 text-blue-600 shadow-sm border border-blue-100/50">
                     <span className="text-xl drop-shadow-sm">📘</span>
                   </div>
-                  <h2 className="text-xl font-bold text-gray-900">{category}</h2>
+                  {isGlobalEditing ? (
+                    <EditableCategoryTitle
+                      category={category}
+                      onRename={(nextValue) => void executeRenameCategory(category, nextValue)}
+                    />
+                  ) : (
+                    <h2 className="text-xl font-bold text-gray-900">{category}</h2>
+                  )}
                   {isGlobalEditing && (
                     <button
                       onClick={() => setCategoryToDelete(category)}
@@ -887,128 +1081,121 @@ export function MistakeBookPage() {
                       掌握度 <span className={hasCatMastery ? 'text-blue-600' : 'text-gray-400'}>{hasCatMastery ? `${catMastery}%` : '暂无数据'}</span>
                     </p>
                     <div className="h-2 w-full overflow-hidden rounded-full bg-blue-100/50">
-                      <div className={`h-full transition-all duration-1000 ease-out rounded-full ${hasCatMastery ? 'bg-blue-600 shadow-[0_0_8px_rgba(37,99,235,0.4)]' : 'bg-gray-300'}`} style={{ width: `${catMastery}%` }} />
+                      <div className={`h-full transition-all duration-1000 ease-out rounded-full ${hasCatMastery ? 'bg-blue-600 shadow-[0_0_8px_rgba(37,99,235,0.4)]' : 'bg-gray-300'}`} style={{ width: mounted ? `${catMastery}%` : '0%' }} />
                     </div>
                   </div>
                 </div>
               </div>
 
-              <div className="space-y-6">
+              <div className="flex flex-1 flex-col space-y-6">
                 {(() => {
-                  // Flatten all L2 nodes into a single array for the category
                   const nodesArray = Object.values(l2Map).flatMap(nodes => 
                     Object.entries(nodes).map(([node, list]) => {
-                      const pending = list.filter(item => (item.mastery_level ?? 0) < 80).length;
-                      let status = 'green';
-                      let priority = 3;
-                      if (list.length === 0) {
-                        status = 'orange';
-                        priority = 2;
-                      } else if (pending > 5) {
-                        status = 'red';
-                        priority = 1;
-                      } else if (pending >= 1) {
-                        status = 'orange';
-                        priority = 2;
-                      }
-                      return { node, list, pending, status, priority, l2: Object.keys(l2Map).find(k => l2Map[k][node]) || '默认分类' };
+                      const { pending, priority, status } = resolveNodeVisualStatus(list);
+                      const l2 = Object.keys(l2Map).find(k => l2Map[k][node]) || '默认分类';
+                      return { id: `${l2}__${node}`, node, list, pending, status, priority, l2 };
                     })
                   );
+                  const categoryOrderKey = `${subject}-${category}-all`;
+                  const savedOrder = sortConfig[categoryOrderKey] || [];
+                  const sortedNodes = [...nodesArray].sort((a, b) => {
+                    const idxA = savedOrder.indexOf(a.node);
+                    const idxB = savedOrder.indexOf(b.node);
+                    if (idxA !== -1 && idxB !== -1) return idxA - idxB;
+                    if (idxA !== -1) return -1;
+                    if (idxB !== -1) return 1;
+                    return a.priority - b.priority;
+                  });
 
-                  nodesArray.sort((a, b) => a.priority - b.priority);
+                  const resolveButtonClasses = (status: NodeVisualStatus, list: Question[]) => {
+                    if (list.length === 0) {
+                      return 'border-emerald-100 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 hover:border-emerald-200 dark:border-emerald-900/50 dark:bg-emerald-950/30 dark:text-emerald-400';
+                    }
+                    if (status === 'red') {
+                      return 'border-rose-100 bg-rose-50 text-rose-700 hover:bg-rose-100 hover:border-rose-200 dark:border-rose-900/50 dark:bg-rose-950/30 dark:text-rose-400';
+                    }
+                    if (status === 'orange') {
+                      return 'border-amber-100 bg-amber-50 text-amber-700 hover:bg-amber-100 hover:border-amber-200 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-400';
+                    }
+                    return 'border-emerald-100 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 hover:border-emerald-200 dark:border-emerald-900/50 dark:bg-emerald-950/30 dark:text-emerald-400';
+                  };
 
+                  if (isGlobalEditing) {
+                    return (
+                      <div className="space-y-2 pt-2 pb-2">
+                        <ReactSortable
+                          list={sortedNodes}
+                          setList={(newState) => {
+                            const nextOrder = newState.map((item) => item.node);
+                            setSortConfig((prev) => {
+                              const prevOrder = prev[categoryOrderKey] || [];
+                              if (JSON.stringify(prevOrder) === JSON.stringify(nextOrder)) return prev;
+                              return {
+                                ...prev,
+                                [categoryOrderKey]: nextOrder,
+                              };
+                            });
+                            const needMove = Array.from(new Set(
+                              nextOrder.filter((nodeName) => getKnowledgeNodeMeta(subject as Subject, nodeName).category !== category)
+                            ));
+                            if (needMove.length > 0) {
+                              void Promise.all(needMove.map((nodeName) => executeMoveNodeTag(nodeName, category)));
+                            }
+                          }}
+                          group={{ name: `${subject}-mistake-node-edit-all`, pull: true, put: true }}
+                          animation={300}
+                          easing="cubic-bezier(0.25, 1, 0.5, 1)"
+                          ghostClass="opacity-30"
+                          dragClass="scale-105"
+                          className="flex flex-wrap gap-2.5 min-h-[40px] p-1.5 -m-1.5 rounded-xl transition-all duration-300 border-2 border-transparent"
+                        >
+                          {sortedNodes.map(({ node, status, list }) => (
+                            <EditableTag
+                              key={node}
+                              node={node}
+                              buttonClasses={resolveButtonClasses(status, list)}
+                              onRename={(newVal) => executeRenameNodeTag(node, newVal)}
+                              onDelete={() => executeDeleteNodeTag(node)}
+                            />
+                          ))}
+                        </ReactSortable>
+                        <div className="pt-1">
+                          <AddTagBox onAdd={async (tag) => {
+                            if (Object.values(l2Map).some(nodes => Boolean(nodes[tag]))) {
+                              throw new Error(`标签「${tag}」已存在`);
+                            }
+                            await registerCustomKnowledgeTaxonomy(tag, category, '默认分类', subject);
+                            approveNewTags({ knowledge_point: [tag] });
+                            setTagVersion(v => v + 1);
+                            toast.success(`已新增标签「${tag}」`);
+                          }} />
+                        </div>
+                      </div>
+                    );
+                  }
+
+                  const grouped = [
+                    { id: 'red', nodes: sortedNodes.filter(n => n.status === 'red') },
+                    { id: 'orange', nodes: sortedNodes.filter(n => n.status === 'orange') },
+                    { id: 'green', nodes: sortedNodes.filter(n => n.status === 'green') },
+                  ];
                   return (
                     <div className="flex flex-col gap-6 pt-2 pb-2">
-                      {[
-                        { id: 'red', nodes: nodesArray.filter(n => n.status === 'red') },
-                        { id: 'orange', nodes: nodesArray.filter(n => n.status === 'orange') },
-                        { id: 'green', nodes: nodesArray.filter(n => n.status === 'green' || n.status === 'gray') }
-                      ].map(group => group.nodes.length > 0 || (isGlobalEditing && group.id === 'green') ? (
+                      {grouped.map(group => group.nodes.length > 0 ? (
                         <div key={group.id} className="space-y-2">
-                          <ReactSortable
-                            list={group.nodes}
-                            setList={(newState) => {
-                              if (JSON.stringify(newState.map(n => n.node)) === JSON.stringify(group.nodes.map(n => n.node))) return;
-                              
-                              setSortConfig(prev => {
-                                const groupKey = `${subject}-${category}-${group.id}`;
-                                return {
-                                  ...prev,
-                                  [groupKey]: newState.map(n => n.node)
-                                };
-                              });
-                            }}
-                            group={{ name: `${category}-${group.id}`, pull: false, put: false }}
-                            animation={300}
-                            easing="cubic-bezier(0.25, 1, 0.5, 1)"
-                            ghostClass="opacity-30"
-                            dragClass="scale-105"
-                            disabled={!isGlobalEditing} // Only sortable in edit mode
-                            className="flex flex-wrap gap-2.5 min-h-[40px] p-1.5 -m-1.5 rounded-xl transition-all duration-300 border-2 border-transparent"
-                          >
-                            {(() => {
-                              const groupKey = `${subject}-${category}-${group.id}`;
-                              const savedOrder = sortConfig[groupKey] || [];
-                              const sortedGroupNodes = [...group.nodes].sort((a, b) => {
-                                const idxA = savedOrder.indexOf(a.node);
-                                const idxB = savedOrder.indexOf(b.node);
-                                if (idxA !== -1 && idxB !== -1) return idxA - idxB;
-                                if (idxA !== -1) return -1;
-                                if (idxB !== -1) return 1;
-                                return 0;
-                              });
-
-                              return sortedGroupNodes.map(({ node, status, list, l2 }) => {
-                                let buttonClasses = '';
-                                if (list.length === 0) {
-                                  buttonClasses = 'border-slate-200 bg-slate-50 text-slate-600 hover:bg-slate-100 dark:border-slate-800 dark:bg-slate-900/50 dark:text-slate-400';
-                                } else if (status === 'red') {
-                                  buttonClasses = 'border-rose-100 bg-rose-50 text-rose-700 hover:bg-rose-100 hover:border-rose-200 dark:border-rose-900/50 dark:bg-rose-950/30 dark:text-rose-400';
-                                } else if (status === 'orange') {
-                                  buttonClasses = 'border-amber-100 bg-amber-50 text-amber-700 hover:bg-amber-100 hover:border-amber-200 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-400';
-                                } else {
-                                  buttonClasses = 'border-emerald-100 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 hover:border-emerald-200 dark:border-emerald-900/50 dark:bg-emerald-950/30 dark:text-emerald-400';
-                                }
-
-                                if (isGlobalEditing) {
-                                  return (
-                                    <EditableTag
-                                      key={node}
-                                      node={node}
-                                      buttonClasses={buttonClasses}
-                                      onRename={(newVal) => executeRenameNodeTag(node, newVal)}
-                                      onDelete={() => executeDeleteNodeTag(node)}
-                                      onDragStart={() => {}}
-                                    />
-                                  );
-                                }
-
-                                return (
-                                  <button
-                                    key={node}
-                                    type="button"
-                                    onClick={() => navigate(`/questions/node?subject=${encodeURIComponent(subject)}&category=${encodeURIComponent(category)}&l2=${encodeURIComponent(l2)}&node=${encodeURIComponent(node)}`, { state: { subject, category, l2, node } })}
-                                    className={`inline-flex items-center px-3 py-1.5 rounded-xl border text-xs font-bold transition-all duration-300 shadow-sm cursor-pointer hover:-translate-y-0.5 active:scale-95 ${buttonClasses}`}
-                                    title="点击查看错题"
-                                  >
-                                    {node}
-                                  </button>
-                                );
-                              });
-                            })()}
-                          </ReactSortable>
-                          
-                          {isGlobalEditing && group.id === 'green' && (
-                            <div className="pt-1">
-                              <AddTagBox onAdd={async (tag) => {
-                                 try {
-                                   await registerCustomKnowledgeTaxonomy(tag, category, '默认分类', subject);
-                                   approveNewTags({ knowledge_point: [tag] });
-                                   setTagVersion(v => v + 1);
-                                 } catch (e:any) { toast.error(e.message); }
-                              }} />
-                            </div>
-                          )}
+                          <div className="flex flex-wrap gap-2.5 min-h-[40px] p-1.5 -m-1.5 rounded-xl transition-all duration-300 border-2 border-transparent">
+                            {group.nodes.map(({ node, status, list, l2 }) => (
+                              <button
+                                key={node}
+                                type="button"
+                                onClick={() => navigate(`/questions/node?subject=${encodeURIComponent(subject)}&category=${encodeURIComponent(category)}&l2=${encodeURIComponent(l2)}&node=${encodeURIComponent(node)}`, { state: { subject, category, l2, node } })}
+                                className={`inline-flex items-center px-3 py-1.5 rounded-xl border text-xs font-bold transition-all duration-300 shadow-sm cursor-pointer hover:-translate-y-0.5 active:scale-95 ${resolveButtonClasses(status, list)}`}
+                                title="点击查看错题"
+                              >
+                                {node}
+                              </button>
+                            ))}
+                          </div>
                         </div>
                       ) : null)}
                     </div>
@@ -1018,6 +1205,7 @@ export function MistakeBookPage() {
             </article>
           );
         })}
+        </ReactSortable>
       </section>
 
       <AlertDialog open={!!categoryToDelete} onOpenChange={(open: boolean) => !open && setCategoryToDelete(null)}>

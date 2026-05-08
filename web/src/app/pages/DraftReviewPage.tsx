@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { ImagePlus, Send, Sparkles, X, FileText, CheckCircle, GraduationCap, BrainCircuit, ChevronDown, ChevronRight, RefreshCw, Loader2, Edit2, Hash, Compass } from 'lucide-react';
+import { Send, Sparkles, X, CheckCircle, BrainCircuit, ChevronDown, ChevronRight, RefreshCw, Loader2, Edit2, Hash, ImagePlus, Square } from 'lucide-react';
 import { useNavigate } from 'react-router';
 import { buildCopilotLearningProfile, chatApi, questionsApi } from '../lib/api';
 import {
@@ -15,10 +15,12 @@ import {
 } from '../lib/copilot';
 import type { Question, Subject } from '../lib/types';
 import { formatQuestionTextForStorage, parseQuestionPreview } from '../lib/questionPreview';
-import { buildTipsFromKeywordCards, mergeKnowledgeDeltaIntoDrawer, mergeLearningDrawerContent, readLearningContentState, writeLearningContentState } from '../lib/knowledgeContent';
+import { normalizeDraftForImportPolicy, validateDraftsBeforeImportPolicy } from '../lib/draftImportPolicy';
+import { buildKnowledgeUpdatePreviewModel, mergeLearningDrawerContent, readLearningContentState, resolveLearningDrawerContentByTag, resolveLearningDrawerReferenceForUpdate, sanitizeKnowledgeMarkdownForStorage, writeLearningContentState } from '../lib/knowledgeContent';
 import { toast } from 'sonner';
 import { useConfirm } from '../components/business/ConfirmProvider';
 import { CopilotHandoffDialog } from '../components/business/CopilotHandoffDialog';
+import type { ReviewPreset, DrillPreset } from '../components/business/CopilotHandoffDialog';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
@@ -26,9 +28,10 @@ import rehypeKatex from 'rehype-katex';
 import { MistakeQuestionPreview } from '../components/business/MistakeQuestionPreview';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select';
 import { KnowledgeUpdatePreview } from '../components/business/KnowledgeUpdatePreview';
+import { InlineQuizCard } from '../components/business/InlineQuizCard';
 import { getSubjectColor } from '../lib/subjects';
 import { getKnowledgePointsBySubjectFromTaxonomy, inferKnowledgeNodeMetaForNewTag, registerCustomKnowledgeTaxonomy } from '../lib/knowledgeTaxonomy';
-import { buildCopilotModePrompt, getCopilotCapabilityMeta, getCopilotModeMeta, getModeSwitchToast, inferCopilotCapability, inferCopilotMode, isActionAllowedForMode, normalizeDrillPreset, normalizeReviewPreset, type CopilotCapability, type CopilotMode } from '../lib/copilotMode';
+import { buildCopilotModePrompt, getCopilotCapabilityMeta, getCopilotModeMeta, inferCopilotCapability, isActionAllowedForMode, normalizeDrillPreset, normalizeReviewPreset, type CopilotCapability, type CopilotMode } from '../lib/copilotMode';
 import { buildDraftIngestionBuckets, loadDraftIngestionBucketContext, runUnifiedDuplicateGuard, type DraftIngestionBucket, type DraftIngestionBucketContext, type DuplicateGuardResult } from '../lib/mistakeIngestion';
 import { matchesQuestionIdentifier } from '../lib/entityIds';
 import { buildLearningSessionNavigation, createLearningSessionProposal } from '../lib/learningSession';
@@ -78,7 +81,7 @@ type DraftHandoffState =
     sourceLabel: string;
     reason: string;
     expectedBenefit: string;
-    preset: ReturnType<typeof normalizeReviewPreset>;
+    preset: ReviewPreset;
   }
   | {
     kind: 'practice';
@@ -87,7 +90,7 @@ type DraftHandoffState =
     sourceLabel: string;
     reason: string;
     expectedBenefit: string;
-    preset: ReturnType<typeof normalizeDrillPreset>;
+    preset: DrillPreset;
   };
 
 const SUGGESTIONS = [
@@ -100,9 +103,7 @@ const SUGGESTIONS = [
 const DRAFT_CHAT_STORAGE_KEY = 'vlearn_ai_manager_temp_chat';
 const DRAFT_SESSION_UI_STORAGE_KEY = 'vlearn_ai_manager_temp_ui_state';
 const DRAFT_DEEP_THINKING_KEY = 'vlearn_ai_manager_deep_thinking';
-const DRAFT_MODE_PREFERENCE_STORAGE_KEY = 'vlearn_ai_manager_mode_preference';
 const SELECT_EMPTY_VALUE = '__empty__';
-const UNASSIGNED_KNOWLEDGE_GROUP = '__unassigned__';
 const SUBJECT_OPTIONS = ['英语', 'C语言'] as const;
 const toSafeString = (value: unknown) => (typeof value === 'string' ? value : String(value ?? ''));
 const toNodeList = (value: unknown): string[] => {
@@ -110,8 +111,28 @@ const toNodeList = (value: unknown): string[] => {
   if (typeof value === 'string' && value.trim()) return [value.trim()];
   return [];
 };
+const parseLearningContentActionFromText = (raw: string): CopilotActionProposal | null => {
+  const text = String(raw || '').replace(/\r\n/g, '\n').trim();
+  if (!text) return null;
+  const headingMatch = text.match(/^\s{0,3}#{1,6}\s+(.+?)\s*$/m);
+  const inferredTag = String(headingMatch?.[1] || '').trim();
+  if (!inferredTag) return null;
+  const markdown = sanitizeKnowledgeMarkdownForStorage(text.match(/(#{1,6}\s+[\s\S]*)$/)?.[1]?.trim() || text, inferredTag);
+  if (!markdown) return null;
+  return {
+    type: 'update_learning_content',
+    risk: 'low',
+    title: '知识点修订',
+    description: '根据当前整理结果自动生成入库卡片',
+    payload: {
+      tag: inferredTag,
+      node: inferredTag,
+      markdown,
+    },
+  };
+};
 
-const CAPABILITY_ORDER: CopilotCapability[] = ['organize', 'explain', 'recommend', 'launch'];
+const COPILOT_MODES: CopilotCapability[] = ['organize', 'explain', 'recommend', 'launch'];
 
 type DraftReviewPersistedUiState = {
   executedActions?: Record<string, boolean>;
@@ -122,26 +143,42 @@ type DraftReviewPersistedUiState = {
   createdTagsByMessage?: Record<number, string[]>;
 }
 
-type DraftModePreferenceState = {
-  currentMode?: CopilotMode;
-  currentCapability?: CopilotCapability;
-  modeSelectionSource?: 'auto' | 'manual';
+function normalizePersistedDraftMessages(raw: unknown): DraftChatMessage[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((item) => item && typeof item === 'object')
+    .map((item): DraftChatMessage | null => {
+      const role = (item as any).role === 'assistant' ? 'assistant' : (item as any).role === 'user' ? 'user' : null;
+      if (!role) return null;
+      const rawContent = (item as any).content;
+      const normalizedContent = typeof rawContent === 'string'
+        ? rawContent
+        : (rawContent && typeof rawContent === 'object' ? '' : toSafeString(rawContent));
+      return {
+        role,
+        content: normalizedContent,
+        image: typeof (item as any).image === 'string' ? (item as any).image : undefined,
+        mode: (item as any).mode,
+        action: (item as any).action,
+        drafts: Array.isArray((item as any).drafts) ? (item as any).drafts : undefined,
+        knowledgeUpdates: Array.isArray((item as any).knowledgeUpdates) ? (item as any).knowledgeUpdates : undefined,
+        isError: Boolean((item as any).isError),
+        originalAsk: typeof (item as any).originalAsk === 'string' ? (item as any).originalAsk : undefined,
+        reasoningContent: typeof (item as any).reasoningContent === 'string' ? (item as any).reasoningContent : undefined,
+      };
+    })
+    .filter((item): item is DraftChatMessage => Boolean(item))
+    .filter((item) => (
+      String(item.content || '').trim().length > 0
+      || String(item.reasoningContent || '').trim().length > 0
+      || Boolean(item.image)
+    ));
 }
 
 function readDraftReviewPersistedUiState(): DraftReviewPersistedUiState {
   if (typeof window === 'undefined') return {};
   try {
     const raw = sessionStorage.getItem(DRAFT_SESSION_UI_STORAGE_KEY);
-    return raw ? JSON.parse(raw) : {};
-  } catch {
-    return {};
-  }
-}
-
-function readDraftModePreferenceState(): DraftModePreferenceState {
-  if (typeof window === 'undefined') return {};
-  try {
-    const raw = window.localStorage.getItem(DRAFT_MODE_PREFERENCE_STORAGE_KEY);
     return raw ? JSON.parse(raw) : {};
   } catch {
     return {};
@@ -227,7 +264,7 @@ function ensureDraftNote(raw: any) {
   const candidate = [raw?.note, raw?.analysis, raw?.explanation]
     .find((item) => typeof item === 'string' && String(item).trim().length > 0);
   if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
-  return ['【考查知识点】待补充', '【错因分析】待补充', '【核心解析】待补充'].join('\n');
+  return '待补充解析';
 }
 
 function ensureDraftSummary(raw: any) {
@@ -253,12 +290,19 @@ export function DraftReviewPage() {
   const navigate = useNavigate();
   const confirm = useConfirm();
   const persistedUiState = useMemo(() => readDraftReviewPersistedUiState(), []);
-  const persistedModePreference = useMemo(() => readDraftModePreferenceState(), []);
   const [dictionary, setDictionary] = useState(getCanonicalTagDictionary());
   const [messages, setMessages] = useState<DraftChatMessage[]>(() => {
     try {
       const savedChat = sessionStorage.getItem(DRAFT_CHAT_STORAGE_KEY);
-      return savedChat ? JSON.parse(savedChat) : [];
+      if (!savedChat) return [];
+      const parsed = JSON.parse(savedChat);
+      if (Array.isArray(parsed)) {
+        return normalizePersistedDraftMessages(parsed);
+      }
+      if (Array.isArray(parsed?.messages)) {
+        return normalizePersistedDraftMessages(parsed.messages);
+      }
+      return [];
     } catch (error) {
       console.error('Failed to parse chat history', error);
       return [];
@@ -266,12 +310,12 @@ export function DraftReviewPage() {
   });
   const [input, setInput] = useState('');
   const [imagePreview, setImagePreview] = useState<string | null>(null);
-  const [currentMode, setCurrentMode] = useState<CopilotMode>(() => persistedModePreference.currentMode || 'ingest');
-  const [currentCapability, setCurrentCapability] = useState<CopilotCapability>(() => persistedModePreference.currentCapability || 'organize');
-  const [modeSelectionSource, setModeSelectionSource] = useState<'auto' | 'manual'>(() => persistedModePreference.modeSelectionSource || 'auto');
+  const [currentMode, setCurrentMode] = useState<CopilotMode>('study');
+  const [currentCapability, setCurrentCapability] = useState<CopilotCapability>('explain');
+  const [modeSelectionSource, setModeSelectionSource] = useState<'auto' | 'manual'>('auto');
   const [sending, setSending] = useState(false);
   const [executingKey, setExecutingKey] = useState<string | null>(null);
-  const [semanticCheckingKey, setSemanticCheckingKey] = useState<string | null>(null);
+  const [, setSemanticCheckingKey] = useState<string | null>(null);
   const [reanalyzingKey, setReanalyzingKey] = useState<string | null>(null);
   const [executedActions, setExecutedActions] = useState<Record<string, boolean>>(() => persistedUiState.executedActions || {});
   const [draftEdits, setDraftEdits] = useState<Record<string, DraftQuestion>>(() => persistedUiState.draftEdits || {});
@@ -290,6 +334,8 @@ export function DraftReviewPage() {
   const [preflightingBatchKey, setPreflightingBatchKey] = useState<string | null>(null);
   const [handoffState, setHandoffState] = useState<DraftHandoffState | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const stopRequestedRef = useRef(false);
+  const requestSeqRef = useRef(0);
   const handoffResolverRef = useRef<((result: { status: 'start'; preset: DraftHandoffState['preset'] } | { status: 'cancel' }) => void) | null>(null);
   
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -298,9 +344,14 @@ export function DraftReviewPage() {
   const batchCardRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const highlightTimerRef = useRef<number | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const currentModeMeta = getCopilotModeMeta(currentMode);
   const currentCapabilityMeta = getCopilotCapabilityMeta(currentCapability);
-  const shouldHideRouteEntrances = modeSelectionSource === 'manual' && currentCapability === 'organize';
+  const capabilityStatusLabel = currentCapabilityMeta.label;
+  const capabilityStatusHint = currentCapabilityMeta.summary;
+  const shouldHideRouteEntrances = currentCapability === 'organize';
+  const visibleMessages = useMemo(
+    () => normalizePersistedDraftMessages(messages),
+    [messages],
+  );
 
   const resolveModeByCapability = useCallback((capability: CopilotCapability): CopilotMode => {
     if (capability === 'organize') return 'ingest';
@@ -331,30 +382,18 @@ export function DraftReviewPage() {
     if (nextMode !== currentMode || capability !== currentCapability) {
       toast.info(`${getCopilotCapabilityMeta(capability).label}：${getCopilotCapabilityMeta(capability).summary}`);
     }
+    setModeSelectionSource('manual');
     setCurrentMode(nextMode);
     setCurrentCapability(capability);
-    setModeSelectionSource('manual');
-  };
-
-  const handleAutoMode = () => {
-    const inferredMode = inferCopilotMode({ ask: input, surface: 'draft', hasImage: Boolean(imagePreview) });
-    const inferredCapability = inferCopilotCapability({ ask: input, surface: 'draft', hasImage: Boolean(imagePreview) });
-    if (inferredMode !== currentMode || inferredCapability !== currentCapability) {
-      toast.info(getModeSwitchToast(inferredMode));
-    }
-    setCurrentMode(inferredMode);
-    setCurrentCapability(inferredCapability);
-    setModeSelectionSource('auto');
   };
 
   const sanitizeVisibleAction = useCallback((
     action: CopilotActionProposal | null,
     mode: CopilotMode,
     capability: CopilotCapability,
-    selectionSource: 'auto' | 'manual',
   ) => {
     if (!action) return undefined;
-    if (selectionSource === 'manual' && capability === 'organize' && (action.type === 'start_review' || action.type === 'start_drill')) {
+    if (capability === 'organize' && (action.type === 'start_review' || action.type === 'start_drill')) {
       return undefined;
     }
     if (!isActionAllowedForMode(mode, action.type)) {
@@ -365,20 +404,18 @@ export function DraftReviewPage() {
 
   useEffect(() => {
     try {
-      // 限制最大存储条数，防止撑爆存储 (例如只保留最近 50 条)
-      const messagesToSave = messages.slice(-50);
+      const messagesToSave = visibleMessages.slice(-50);
       sessionStorage.setItem(DRAFT_CHAT_STORAGE_KEY, JSON.stringify(messagesToSave));
     } catch (error) {
       console.warn('Session storage is full or unavailable', error);
       try {
-        // 如果因为图片太大导致超限，尝试清理图片后保存
-        const withoutImages = messages.slice(-50).map(m => ({ ...m, image: undefined }));
+        const withoutImages = visibleMessages.slice(-50).map(m => ({ ...m, image: undefined }));
         sessionStorage.setItem(DRAFT_CHAT_STORAGE_KEY, JSON.stringify(withoutImages));
       } catch (e2) {
         console.warn('Still failed to save chat to session storage', e2);
       }
     }
-  }, [messages]);
+  }, [visibleMessages]);
 
   useEffect(() => {
     try {
@@ -404,30 +441,6 @@ export function DraftReviewPage() {
   }, [activeBatchByMessage, batchDisplayMode, collapsedCompletedByMessage, createdTagsByMessage, draftEdits, executedActions]);
 
   useEffect(() => {
-    try {
-      window.localStorage.setItem(DRAFT_MODE_PREFERENCE_STORAGE_KEY, JSON.stringify({
-        currentMode,
-        currentCapability,
-        modeSelectionSource,
-      }));
-    } catch (error) {
-      console.warn('Failed to persist AI 管家模式偏好', error);
-    }
-  }, [currentCapability, currentMode, modeSelectionSource]);
-
-  const adjustHeight = () => {
-    const textarea = textareaRef.current;
-    if (textarea) {
-      textarea.style.height = 'auto';
-      textarea.style.height = `${Math.min(textarea.scrollHeight, 200)}px`;
-    }
-  };
-
-  useEffect(() => {
-    adjustHeight();
-  }, [input]);
-
-  useEffect(() => {
     void (async () => {
       await hydrateTagExtensionsFromCloud();
       setDictionary(getCanonicalTagDictionary());
@@ -438,6 +451,15 @@ export function DraftReviewPage() {
     if (typeof window === 'undefined') return;
     window.localStorage.setItem(DRAFT_DEEP_THINKING_KEY, deepThinking ? '1' : '0');
   }, [deepThinking]);
+
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    const maxHeight = 160;
+    textarea.style.height = 'auto';
+    textarea.style.height = `${Math.min(textarea.scrollHeight, maxHeight)}px`;
+    textarea.style.overflowY = textarea.scrollHeight > maxHeight ? 'auto' : 'hidden';
+  }, [input]);
 
   const handleChatScroll = () => {
     const container = scrollContainerRef.current;
@@ -508,12 +530,18 @@ export function DraftReviewPage() {
     const imageHint = hasImage
       ? '用户已上传题目图片（在前端会话中可见），请结合用户描述完成分析。'
       : '用户暂未上传图片。';
+    const capabilityInstruction = capability === 'organize'
+      ? '当前是录入整理模式：可以输出 create_mistake / update_mistake / update_tags / update_learning_content 来生成或更新入库内容。此模式下不要反问“是否需要入库”，直接给可执行卡片。若输出 update_learning_content，markdown 只保留知识内容本体，不要出现“好的我来帮你补充”这类对话语句；若首行标题与知识点标签同名，请省略该标题。'
+      : capability === 'explain'
+        ? '当前是讲解模式：只做讲解、追问、比较与学习建议，禁止输出 create_mistake、update_mistake、update_tags、delete_mistake。若用户明确要入库或修改，请先建议切换到“录入整理”模式。'
+        : capability === 'recommend'
+          ? '当前是计划推荐模式：只给建议与理由，禁止写入动作。若用户要真正入库或修改，请建议切换到“录入整理”模式。'
+          : '当前是跳转启动模式：仅允许 start_review 或 start_drill，用于进入正式页面。';
     return `${learningProfile}
 当前页面：AI 管家
 ${imageHint}
 ${buildCopilotModePrompt(mode, capability)}
-当用户请求是“入库/生成错题卡/整理图片错题/修改待入库草稿”时，你必须输出 create_mistake 动作，并在 payload 中给出可编辑草稿字段。
-如果只是解释题目或答疑，可不输出动作。
+${capabilityInstruction}
 用户请求：${ask}`;
   };
 
@@ -567,9 +595,9 @@ ${buildCopilotModePrompt(mode, capability)}
     const points = Array.from(new Set(drafts.map((draft) => String(draft.knowledge_point || '').trim()).filter(Boolean)));
     if (points.length === 0) return '暂无知识点总结上下文';
     return points.slice(0, 12).map((point) => {
-      const drawer = content.drawerByTag[point] || {};
-      const summary = String(drawer.summary || '').trim().slice(0, 220);
-      const markdown = String(drawer.markdown || '').trim().slice(0, 220);
+      const drawer = resolveLearningDrawerContentByTag(point, content.drawerByTag);
+      const summary = String(drawer?.summary || '').trim().slice(0, 220);
+      const markdown = String(drawer?.markdown || '').trim().slice(0, 220);
       return `- ${point}\n  - 现有总结：${summary || '暂无'}\n  - 现有补充：${markdown || '暂无'}`;
     }).join('\n');
   };
@@ -666,45 +694,9 @@ ${buildCopilotModePrompt(mode, capability)}
     buildDraftIngestionBuckets(drafts, (draft, absoluteIdx) => getMergedDraft(draft, `${messageIndex}-${absoluteIdx}`))
   );
 
-  const validateDraftsBeforeImport = (items: DraftQuestion[]) => {
-    const issues: string[] = [];
-    items.forEach((draft, index) => {
-      const label = `第 ${index + 1} 题`;
-      const questionText = String(draft.question_text || '').trim();
-      const subject = String(draft.subject || '英语');
-      const knowledgePoint = String(draft.knowledge_point || '').trim();
-      const validKnowledgePoints = getKnowledgePointsBySubjectFromTaxonomy(subject as '英语' | 'C语言');
-      const optionLines = getDraftOptionLines(draft);
-      const note = String(draft.note || '').trim();
-      if (!questionText) {
-        issues.push(`${label}缺少题干，请先补充再入库。`);
-      }
-      if (!knowledgePoint || !validKnowledgePoints.includes(knowledgePoint)) {
-        issues.push(`${label}的知识点必须从标签库中选择。`);
-      }
-      if ((draft.question_type === 'choice' || optionLines.length > 0) && optionLines.length < 2) {
-        issues.push(`${label}是选择题时至少需要 2 个选项。`);
-      }
-      if (!note) {
-        issues.push(`${label}缺少解析/笔记，请先补充再入库。`);
-      }
-    });
-    return issues;
-  };
-
   const prepareDraftForImport = (draft: DraftQuestion) => {
     const completedDraft = ensureDraftCompleteness(draft);
-    return {
-      ...completedDraft,
-      subject: completedDraft?.subject === 'C语言' ? 'C语言' : '英语',
-      question_text: buildDraftPreviewText(completedDraft) || String(completedDraft.question_text || '来自 AI 管家会话'),
-      image_url: completedDraft?.image_url || undefined,
-      knowledge_point: String(completedDraft?.knowledge_point || '').trim(),
-      note: completedDraft?.note || '由 AI 聊天生成',
-      summary: completedDraft?.summary || '',
-      options: getDraftOptionLines(completedDraft),
-      normalized_payload: undefined,
-    } satisfies Partial<Question> & { options?: string[] };
+    return normalizeDraftForImportPolicy(completedDraft);
   };
 
   const buildKnowledgeSuggestions = (
@@ -731,7 +723,7 @@ ${buildCopilotModePrompt(mode, capability)}
     const readyDrafts = readyGroups.flatMap((group) => (
       group.absoluteIndexes.map((absoluteIdx) => getMergedDraft(messageDrafts[absoluteIdx] as DraftQuestion, `${messageIndex}-${absoluteIdx}`))
     ));
-    const validationIssues = validateDraftsBeforeImport(readyDrafts);
+    const validationIssues = validateDraftsBeforeImportPolicy(readyDrafts);
     if (validationIssues.length > 0) {
       throw new Error(validationIssues[0]);
     }
@@ -811,7 +803,7 @@ ${buildCopilotModePrompt(mode, capability)}
     }
     if (action.type === 'create_mistake') {
       const itemsToCreate = drafts && drafts.length > 0 ? drafts : [action.payload];
-      const validationIssues = validateDraftsBeforeImport(itemsToCreate);
+      const validationIssues = validateDraftsBeforeImportPolicy(itemsToCreate);
       if (validationIssues.length > 0) {
         throw new Error(validationIssues[0]);
       }
@@ -868,7 +860,7 @@ ${buildCopilotModePrompt(mode, capability)}
       };
     }
     if (action.type === 'start_review') {
-      const payload = normalizeReviewPreset(action.payload?.preset);
+      const payload = normalizeReviewPreset(action.payload?.preset) as ReviewPreset;
       const handoffResult = await openHandoffDialog({
         kind: 'review',
         capability: activeCapability,
@@ -922,7 +914,7 @@ ${buildCopilotModePrompt(mode, capability)}
       return;
     }
     if (action.type === 'start_drill') {
-      const payload = normalizeDrillPreset(action.payload?.preset);
+      const payload = normalizeDrillPreset(action.payload?.preset) as DrillPreset;
       const nodes = toNodeList((payload as any)?.nodes);
       const handoffResult = await openHandoffDialog({
         kind: 'practice',
@@ -1016,7 +1008,8 @@ ${buildCopilotModePrompt(mode, capability)}
         const targetTag = String(normalizedUpdate.tag || normalizedUpdate.node || normalizedUpdate.knowledge_point || '').trim();
         if (!targetTag) continue;
         
-        const merged = mergeLearningDrawerContent(current.drawerByTag[targetTag], {
+        const existingDrawer = resolveLearningDrawerContentByTag(targetTag, current.drawerByTag);
+        const merged = mergeLearningDrawerContent(existingDrawer, {
           targetNode: targetTag,
           note: normalizedUpdate.note,
           markdown: normalizedUpdate.markdown,
@@ -1061,34 +1054,97 @@ ${buildCopilotModePrompt(mode, capability)}
     }
   };
 
-  const extractFirstJsonBlock = (raw: string) => {
-    const normalized = String(raw || '').trim();
-    if (!normalized) return '';
-    const direct = normalized.match(/^\s*\{[\s\S]*\}\s*$/)?.[0];
-    if (direct) return direct;
-    const block = normalized.match(/```json\s*([\s\S]*?)```/i)?.[1]
-      || normalized.match(/```\s*([\s\S]*?)```/i)?.[1];
-    if (block) return block;
-    const start = normalized.indexOf('{');
-    const end = normalized.lastIndexOf('}');
-    if (start >= 0 && end > start) return normalized.slice(start, end + 1);
-    return '';
+
+
+  const normalizeKnowledgeUpdateSubject = (value: unknown, fallback: Subject = '英语'): Subject => (
+    value === 'C语言' ? 'C语言' : value === '英语' ? '英语' : fallback
+  );
+
+  const inferKnowledgeUpdateSubjectByTag = (tag: string, fallback: Subject = '英语'): Subject => {
+    const normalizedTag = String(tag || '').trim();
+    if (!normalizedTag) return fallback;
+    const inEnglish = getKnowledgePointsBySubjectFromTaxonomy('英语').includes(normalizedTag);
+    const inC = getKnowledgePointsBySubjectFromTaxonomy('C语言').includes(normalizedTag);
+    if (inC && !inEnglish) return 'C语言';
+    if (inEnglish && !inC) return '英语';
+    return fallback;
   };
 
-  const applyKnowledgeUpdates = (updates: KnowledgeUpdateDraft[] | undefined) => {
+  const ensureKnowledgeUpdateTagsReady = async (updates: KnowledgeUpdateDraft[]) => {
+    const missingBySubject: Record<Subject, string[]> = { 英语: [], C语言: [] };
+    updates.forEach((update) => {
+      const tag = String(update.tag || '').trim();
+      if (!tag) return;
+      const subject = normalizeKnowledgeUpdateSubject(update.subject, '英语');
+      const known = getKnowledgePointsBySubjectFromTaxonomy(subject);
+      if (!known.includes(tag)) {
+        missingBySubject[subject].push(tag);
+      }
+    });
+    const uniqueMissing: Record<Subject, string[]> = {
+      英语: Array.from(new Set(missingBySubject.英语)),
+      C语言: Array.from(new Set(missingBySubject.C语言)),
+    };
+    if (uniqueMissing.英语.length === 0 && uniqueMissing.C语言.length === 0) {
+      return [] as Array<{ tag: string; subject: Subject }>;
+    }
+    const sections = [
+      uniqueMissing.英语.length > 0 ? `英语：${uniqueMissing.英语.join('、')}` : '',
+      uniqueMissing.C语言.length > 0 ? `C语言：${uniqueMissing.C语言.join('、')}` : '',
+    ].filter(Boolean);
+    const approved = await confirm({
+      title: '检测到缺失标签',
+      confirmText: '创建并继续',
+      cancelText: '取消',
+      description: (
+        <div className="space-y-2 text-sm text-gray-700">
+          <p>以下知识点标签尚未存在，是否先创建后再导入？</p>
+          <div className="rounded-xl bg-gray-50 px-3 py-2 leading-relaxed">{sections.join('\n')}</div>
+        </div>
+      ),
+    });
+    if (!approved) {
+      throw new Error('用户取消操作');
+    }
+    const created: Array<{ tag: string; subject: Subject }> = [];
+    for (const subject of ['英语', 'C语言'] as Subject[]) {
+      for (const tag of uniqueMissing[subject]) {
+        const meta = inferKnowledgeNodeMetaForNewTag(subject, tag);
+        await registerCustomKnowledgeTaxonomy(tag, meta.category, meta.branch, subject);
+        created.push({ tag, subject });
+      }
+    }
+    setDictionary(getCanonicalTagDictionary());
+    return created;
+  };
+
+  const resolveKnowledgeReferenceDrawer = (
+    update: KnowledgeUpdateDraft,
+    state: ReturnType<typeof readLearningContentState>,
+    fallbackSubject: Subject = '英语',
+  ) => {
+    const subject = normalizeKnowledgeUpdateSubject(
+      update.subject,
+      inferKnowledgeUpdateSubjectByTag(update.tag, fallbackSubject),
+    );
+    return resolveLearningDrawerReferenceForUpdate(update.tag, state.drawerByTag, subject);
+  };
+
+  const applyKnowledgeUpdates = async (updates: KnowledgeUpdateDraft[] | undefined) => {
     const normalizedUpdates = Array.isArray(updates)
       ? updates.filter((update) => Boolean(update?.tag))
       : [];
     if (normalizedUpdates.length === 0) {
-      return { updatedCount: 0, skippedCount: 0 };
+      return { updatedCount: 0, skippedCount: 0, createdTags: [] as Array<{ tag: string; subject: Subject }> };
     }
-
+    const createdTags = await ensureKnowledgeUpdateTagsReady(normalizedUpdates);
     const current = readLearningContentState();
     let updatedCount = 0;
     let skippedCount = 0;
 
     for (const update of normalizedUpdates) {
-      const merged = mergeLearningDrawerContent(current.drawerByTag[update.tag], {
+      const reference = resolveKnowledgeReferenceDrawer(update, current);
+      const merged = mergeLearningDrawerContent(current.drawerByTag[update.tag] || reference.drawer, {
         targetNode: update.tag,
         note: update.note,
         markdown: update.markdown,
@@ -1111,7 +1167,7 @@ ${buildCopilotModePrompt(mode, capability)}
       writeLearningContentState(current);
     }
 
-    return { updatedCount, skippedCount };
+    return { updatedCount, skippedCount, createdTags };
   };
 
   const getKnowledgeUpdatesForTag = (updates: KnowledgeUpdateDraft[] | undefined, tag: string) => (
@@ -1123,71 +1179,6 @@ ${buildCopilotModePrompt(mode, capability)}
   const buildKnowledgeUpdateSummary = (updates: KnowledgeUpdateDraft[] | undefined) => {
     const normalized = (updates || []).map((update) => String(update.tag || '').trim()).filter(Boolean);
     return Array.from(new Set(normalized));
-  };
-
-  const syncKnowledgeByGroup = async (groupLabel: string, drafts: DraftQuestion[]) => {
-    if (!groupLabel || groupLabel === '未选择知识点' || drafts.length === 0) {
-      return { decision: 'skip', reason: '未选择知识点，跳过沉淀' };
-    }
-    const current = readLearningContentState();
-    const existingDrawer = current.drawerByTag[groupLabel] || {};
-    const existingMarkdown = String(existingDrawer.markdown || '').trim();
-    const groupedEvidence = drafts.map((draft, index) => {
-      const answer = String(draft.correct_answer || '').trim();
-      const note = String(draft.note || '').trim();
-      const questionText = buildDraftPreviewText(draft).slice(0, 240);
-      return `题目${index + 1}\n- 题干：${questionText || '无'}\n- 正确答案：${answer || '无'}\n- 解析：${note || '无'}`;
-    }).join('\n\n');
-    const syncPrompt = `你是知识点沉淀助手。请根据“旧知识点内容”与“本批错题证据”判断是否需要更新这个知识点笔记。
-输出要求：只返回 JSON，不要解释。
-JSON 结构：
-{
-  "decision": "skip 或 rewrite 或 create",
-  "reason": "简短原因",
-  "markdown": "仅当 rewrite 或 create 时返回，必须是完整的结构化 Markdown 笔记"
-}
-规则：
-1. 若旧内容已覆盖本批要点，decision 必须为 skip。
-2. 若旧内容为空但本批形成了可沉淀的结构化笔记，decision 为 create。
-3. 若旧内容需要改写、压缩、重组或补入新规律，decision 为 rewrite，并返回完整 Markdown，而不是只返回增量片段。
-4. Markdown 必须按具体的子知识点划分为 \`###\` 标题（如 \`### 语法结构\`、\`### 运算符优先级\`、\`### 易错考点\` 等）组织；若本知识点内容体量大，可在组内再用 \`####\` 拆分子点：
-### 知识点分组
-#### 子知识点
-- ...
-5. 禁止复述旧内容、禁止空泛废话、禁止输出与错题无关内容，禁止添加任何“这是知识点总结”之类冗余大标题。
-知识点：${groupLabel}
-旧知识点内容：
-${existingMarkdown || '（空）'}
-本批错题证据：
-${groupedEvidence}`;
-    const raw = await new Promise<string>((resolve, reject) => {
-      chatApi.streamCopilot(
-        [{ role: 'user', content: syncPrompt }],
-        () => {},
-        (full) => resolve(full),
-        (error) => reject(new Error(error)),
-        { injectLearningProfile: false, enableThinking: false },
-      );
-    });
-    const jsonText = extractFirstJsonBlock(raw);
-    let parsed: { decision?: string; reason?: string; markdown?: string } = {};
-    try {
-      parsed = jsonText ? JSON.parse(jsonText) : {};
-    } catch {
-      parsed = {};
-    }
-    const merged = mergeKnowledgeDeltaIntoDrawer(existingDrawer, {
-      targetNode: groupLabel,
-      markdown: parsed.markdown,
-      decision: parsed.decision === 'rewrite' || parsed.decision === 'create' || parsed.decision === 'skip'
-        ? parsed.decision
-        : undefined,
-      reason: parsed.reason,
-      questionCount: drafts.length,
-    });
-    current.drawerByTag[groupLabel] = merged.drawer;
-    writeLearningContentState(current);
-    return { decision: merged.decision, reason: merged.reason };
   };
 
   const reanalyzeDraftBatch = async (
@@ -1216,7 +1207,7 @@ ${groupedEvidence}`;
         correct_answer: draft.correct_answer || '',
         note: draft.note || '',
       }));
-      const reanalyzePrompt = `${buildContextPrompt(previousUserMessage.content, learningProfile, Boolean(previousUserMessage.image))}
+      const reanalyzePrompt = `${buildContextPrompt(previousUserMessage.content, learningProfile, Boolean(previousUserMessage.image), currentMode, currentCapability)}
 请只重新分析当前这一个待确认批次，不要输出与这批无关的内容。
 目标分组：${groupLabel}（题号：${indexedLabel}，共 ${batchDrafts.length} 题）。
 要求：
@@ -1323,7 +1314,7 @@ ${JSON.stringify(draftSnapshot, null, 2)}`;
       cancelText: '继续检查',
       description: (
         <div className="space-y-3 text-sm text-gray-700">
-          <div className="rounded-xl border border-indigo-100 bg-indigo-50 px-3 py-2 text-indigo-700">
+          <div className="rounded-xl border border-blue-100 bg-blue-50 px-3 py-2 text-blue-700">
             本次将按标签桶统一执行入库，并在执行阶段复用统一去重护栏后正式写入。
           </div>
           <div className="rounded-xl bg-gray-50 px-3 py-2 leading-relaxed">
@@ -1363,7 +1354,7 @@ ${JSON.stringify(draftSnapshot, null, 2)}`;
         allowAllDuplicateSkip: true,
         precomputedDuplicateGuard: preview.duplicateGuard,
       });
-      if (action.type === 'create_mistake' && result) {
+      if (action.type === 'create_mistake' && result && 'insertedCount' in result) {
         totalInserted += result.insertedCount;
         totalDuplicate += result.duplicateCount;
       }
@@ -1405,6 +1396,14 @@ ${JSON.stringify(draftSnapshot, null, 2)}`;
   const handleSend = async (quickInput?: string) => {
     const ask = (quickInput || input).trim() || (imagePreview ? '请根据我上传的题图帮我分析并给出下一步建议。' : '');
     if (!ask || sending) return;
+    const requestId = requestSeqRef.current + 1;
+    requestSeqRef.current = requestId;
+    const isCurrentRequest = () => requestSeqRef.current === requestId;
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort('superseded');
+      abortControllerRef.current = null;
+    }
+    stopRequestedRef.current = false;
     setSending(true);
 
     // 智能识别：如果是简单的打招呼，强制跳过深度思考，避免浪费 token 和时间
@@ -1413,21 +1412,17 @@ ${JSON.stringify(draftSnapshot, null, 2)}`;
     
     const currentImage = imagePreview;
     const pendingDraftMessageIndex = currentImage ? -1 : getLatestPendingDraftMessageIndex();
-    const shouldRefinePendingDraft = pendingDraftMessageIndex >= 0 && isDraftRefinementIntent(ask);
-    const inferredMode = shouldRefinePendingDraft
-      ? 'ingest'
-      : inferCopilotMode({ ask, surface: 'draft', hasImage: Boolean(currentImage) });
-    const inferredCapability = shouldRefinePendingDraft
-      ? 'organize'
-      : inferCopilotCapability({ ask, surface: 'draft', hasImage: Boolean(currentImage) });
-    const resolvedSelectionSource = modeSelectionSource === 'manual' && !shouldRefinePendingDraft ? 'manual' : 'auto';
-    const resolvedMode = resolvedSelectionSource === 'manual' ? currentMode : inferredMode;
-    const resolvedCapability = resolvedSelectionSource === 'manual' ? currentCapability : inferredCapability;
-    if (resolvedMode !== currentMode || resolvedCapability !== currentCapability) {
-      toast.info(getModeSwitchToast(resolvedMode));
+    const shouldRefinePendingDraft = currentCapability === 'organize' && pendingDraftMessageIndex >= 0 && isDraftRefinementIntent(ask);
+    const inferredCapability = inferCopilotCapability({ ask, surface: 'draft', hasImage: Boolean(currentImage) });
+    const inferredMode = resolveModeByCapability(inferredCapability);
+    const resolvedMode = modeSelectionSource === 'manual' && !shouldRefinePendingDraft ? currentMode : inferredMode;
+    const resolvedCapability = modeSelectionSource === 'manual' && !shouldRefinePendingDraft ? currentCapability : inferredCapability;
+    if (shouldRefinePendingDraft && resolvedMode !== currentMode) {
+      setCurrentMode(resolvedMode);
     }
-    setCurrentMode(resolvedMode);
-    setCurrentCapability(resolvedCapability);
+    if (shouldRefinePendingDraft && resolvedCapability !== currentCapability) {
+      setCurrentCapability(resolvedCapability);
+    }
     shouldAutoScrollRef.current = true;
     setImagePreview(null);
     
@@ -1437,13 +1432,35 @@ ${JSON.stringify(draftSnapshot, null, 2)}`;
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto';
     }
+    if (isSimpleGreeting) {
+      setMessages(prev => [
+        ...prev,
+        {
+          role: 'assistant',
+          content: '你好，我在。你可以直接说“帮我讲第5题”或“帮我上传一道错题”。',
+          mode: resolvedMode,
+        },
+      ]);
+      setSending(false);
+      return;
+    }
 
     const placeholderIndex = baseMessages.length;
     setMessages(prev => [...prev, { role: 'assistant', content: effectiveDeepThinking ? '' : '正在思考...', reasoningContent: effectiveDeepThinking ? '正在深度思考中...' : undefined, mode: resolvedMode }]);
     if (effectiveDeepThinking) {
       setExpandedThinking(prev => ({ ...prev, [placeholderIndex]: true }));
     }
+    if (stopRequestedRef.current || !isCurrentRequest()) {
+      setSending(false);
+      abortControllerRef.current = null;
+      return;
+    }
     const learningProfile = await buildCopilotLearningProfile();
+    if (stopRequestedRef.current || !isCurrentRequest()) {
+      setSending(false);
+      abortControllerRef.current = null;
+      return;
+    }
 
     await new Promise<void>((resolve) => {
       const requestMessages: Array<{ role: string; content: any }> = [];
@@ -1458,10 +1475,11 @@ ${JSON.stringify(draftSnapshot, null, 2)}`;
 要求：
 1. 必须返回 create_mistake。
 2. payload.questions 题数必须与当前草稿一致（${mergedDrafts.length}题）。
-3. 每题必须有非空 note（至少包含【考查知识点】【错因分析】【核心解析】）。
+3. 每题必须有非空 note，直接写清题眼、错因和结论，不要套固定模板。
 4. 不要给每题预置 summary，summary 可以留空。
 5. 如果用户要求“补解析/补总结”，优先把方法论写进 note，并用 update_learning_content 单独产出知识点总结。
 6. 保留已有题干与选项语义，除非用户明确要求改题。
+7. 若用户要求补充/归并知识点总结，可额外输出 update_learning_content 或 learning_updates。
 知识点总结快照：
 ${knowledgeContext}
 当前待重写草稿：
@@ -1498,6 +1516,7 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
       chatApi.streamCopilot(
         requestMessages,
         (chunk, isReasoning) => {
+          if (!isCurrentRequest()) return;
           setMessages(prev => {
             const next = [...prev];
             const current = next[placeholderIndex];
@@ -1512,9 +1531,16 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
           });
         },
         (full) => {
+          if (!isCurrentRequest()) {
+            resolve();
+            return;
+          }
           abortControllerRef.current = null;
-          const action = sanitizeVisibleAction(parseCopilotAction(full), resolvedMode, resolvedCapability, resolvedSelectionSource);
+          const parsedAction = parseCopilotAction(full);
           let cleaned = stripActionBlock(full) || '我已经完成分析，请查看建议。';
+          const allowKnowledgeUpdate = resolvedCapability === 'organize';
+          const fallbackAction = parsedAction ? null : (allowKnowledgeUpdate ? parseLearningContentActionFromText(cleaned) : null);
+          const action = sanitizeVisibleAction(parsedAction || fallbackAction, resolvedMode, resolvedCapability);
           
           const hasActionBlock = /<ACTION>[\s\S]*?<\/ACTION>/i.test(full) || /```(?:json)?\s*(\{[\s\S]*?(?:"type"|"payload")[\s\S]*?\})\s*```/i.test(full);
           const isParseError = hasActionBlock && !action;
@@ -1525,7 +1551,7 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
           if (shouldRefinePendingDraft) {
             const sourceUserMessage = [...messages.slice(0, pendingDraftMessageIndex)].reverse().find((item) => item.role === 'user');
             const sourceImage = sourceUserMessage?.image;
-            const nextDrafts = extractDraftsFromAction(action, sourceImage || undefined)?.map((draft) => ensureDraftCompleteness(draft));
+            const nextDrafts = extractDraftsFromAction(action ?? null, sourceImage || undefined)?.map((draft) => ensureDraftCompleteness(draft));
             const expectedCount = messages[pendingDraftMessageIndex]?.drafts?.length || 0;
             if (!action || action.type !== 'create_mistake' || !nextDrafts || nextDrafts.length !== expectedCount) {
               setMessages(prev => {
@@ -1575,8 +1601,14 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
             });
             clearBatchExecutionPreview(pendingDraftMessageIndex);
           } else {
-            const rawDrafts = extractDraftsFromAction(action, currentImage || undefined)?.map((draft) => ensureDraftCompleteness(draft));
-            const rawUpdates = extractKnowledgeUpdatesFromAction(action);
+            const rawDrafts = extractDraftsFromAction(action ?? null, currentImage || undefined)?.map((draft) => ensureDraftCompleteness(draft));
+            const extractedUpdates = extractKnowledgeUpdatesFromAction(action ?? null);
+            const fallbackUpdateAction = action?.type === 'update_learning_content' && (!extractedUpdates || extractedUpdates.length === 0)
+              ? parseLearningContentActionFromText(cleaned)
+              : null;
+            const rawUpdates = extractedUpdates && extractedUpdates.length > 0
+              ? extractedUpdates
+              : extractKnowledgeUpdatesFromAction(fallbackUpdateAction);
             setMessages(prev => {
               const next = [...prev];
               const current = next[placeholderIndex];
@@ -1588,11 +1620,23 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
           resolve();
         },
         (error) => {
+          if (!isCurrentRequest()) {
+            resolve();
+            return;
+          }
           abortControllerRef.current = null;
+          const isUserCanceled = error === '已取消本次生成';
           setMessages(prev => {
             const next = [...prev];
             const current = next[placeholderIndex];
-            next[placeholderIndex] = { ...current, role: 'assistant', content: `请求失败/已停止：${error}`, isError: true, originalAsk: ask, mode: resolvedMode };
+            next[placeholderIndex] = {
+              ...current,
+              role: 'assistant',
+              content: isUserCanceled ? '已停止生成。' : `请求失败/已停止：${error}`,
+              isError: isUserCanceled ? false : true,
+              originalAsk: ask,
+              mode: resolvedMode,
+            };
             return next;
           });
           setExpandedThinking(prev => ({ ...prev, [placeholderIndex]: false }));
@@ -1601,15 +1645,36 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
         { injectLearningProfile: false, enableThinking: effectiveDeepThinking, signal: abortControllerRef.current.signal }
       );
     });
+    if (!isCurrentRequest()) return;
     setSending(false);
+    stopRequestedRef.current = false;
   };
 
   const stopGenerating = () => {
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
+    requestSeqRef.current += 1;
+    stopRequestedRef.current = true;
+    const activeController = abortControllerRef.current;
+    if (activeController) {
+      activeController.abort('user_cancel');
       abortControllerRef.current = null;
-      setSending(false);
     }
+    setMessages((prev) => {
+      if (prev.length === 0) return prev;
+      const next = [...prev];
+      const lastIndex = next.length - 1;
+      const lastMessage = next[lastIndex];
+      if (!lastMessage || lastMessage.role !== 'assistant') return prev;
+      const lastContent = String(lastMessage.content || '').trim();
+      if (!lastContent || lastContent === '正在思考...' || lastContent === '正在分析中...') {
+        next[lastIndex] = {
+          ...lastMessage,
+          content: '已停止生成。',
+          reasoningContent: undefined,
+        };
+      }
+      return next;
+    });
+    setSending(false);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -1638,8 +1703,8 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
           <div>
             <h1 className="text-base font-bold text-slate-900 tracking-tight">AI 错题管家</h1>
             <div className="mt-0.5 flex items-center gap-2">
-              <span className="flex items-center gap-1 rounded-md bg-orange-50 px-2 py-0.5 text-[10px] font-bold tracking-wider text-orange-600 uppercase">
-                <div className="h-1.5 w-1.5 rounded-full bg-orange-500 animate-pulse" />
+              <span className="flex items-center gap-1 rounded-md bg-emerald-50 px-2 py-0.5 text-[10px] font-bold tracking-wider text-emerald-700 uppercase">
+                <div className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
                 {currentCapabilityMeta.label}
               </span>
               <p className="text-xs font-medium text-slate-500">{currentCapabilityMeta.summary}</p>
@@ -1668,7 +1733,7 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                   sessionStorage.removeItem(DRAFT_SESSION_UI_STORAGE_KEY);
                 }
               }}
-              className="group flex items-center gap-1.5 rounded-full bg-white px-4 py-2 text-xs font-semibold text-slate-600 border border-slate-200 shadow-sm hover:border-orange-200 hover:bg-orange-50 hover:text-orange-700 transition-all duration-200"
+              className="group flex items-center gap-1.5 rounded-full bg-white px-4 py-2 text-xs font-semibold text-slate-600 border border-slate-200 shadow-sm hover:border-slate-300 hover:bg-slate-100 hover:text-slate-800 transition-all duration-200"
             >
               <RefreshCw className="h-3.5 w-3.5 group-hover:rotate-180 transition-transform duration-500" />
               新对话
@@ -1685,7 +1750,7 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
             <div className="flex flex-col items-center justify-center pt-8 md:pt-16 transition-all duration-500 animate-in fade-in slide-in-from-bottom-8">
               {/* Header Title */}
               <div className="relative mb-10 flex w-full items-center gap-5 rounded-[24px] bg-white/88 p-6 shadow-[0_8px_30px_-12px_rgba(15,23,42,0.12)] border border-white/70 backdrop-blur-xl overflow-hidden">
-                <div className="pointer-events-none absolute -right-8 -top-8 h-32 w-32 rounded-full bg-orange-300/20 blur-3xl" />
+                <div className="pointer-events-none absolute -right-8 -top-8 h-32 w-32 rounded-full bg-slate-300/20 blur-3xl" />
                 <div className="pointer-events-none absolute -bottom-10 left-1/4 h-24 w-24 rounded-full bg-blue-300/10 blur-3xl" />
                 <div className="relative z-10 flex items-center justify-center shrink-0 pl-2">
                   <span className="text-[36px] drop-shadow-md">✨</span>
@@ -1707,14 +1772,14 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                   onClick={() => handleSend(SUGGESTIONS[0].text)}
                   className="group relative flex flex-col justify-between overflow-hidden rounded-[24px] bg-white/88 p-8 text-left shadow-[0_8px_30px_-12px_rgba(15,23,42,0.12)] border border-white/70 backdrop-blur-xl transition-all duration-300 hover:-translate-y-1 hover:shadow-[0_12px_40px_-4px_rgba(0,0,0,0.08)] min-h-[280px]"
                 >
-                  <div className="pointer-events-none absolute -right-10 -top-10 h-40 w-40 rounded-full bg-orange-400/10 blur-3xl transition-opacity group-hover:opacity-100" />
-                  <div className="pointer-events-none absolute -bottom-10 left-1/4 h-32 w-32 rounded-full bg-indigo-300/10 blur-3xl" />
-                  <div className="absolute inset-0 bg-gradient-to-br from-slate-50/50 to-orange-50/30 opacity-60 transition-opacity group-hover:opacity-100" />
+                  <div className="pointer-events-none absolute -right-10 -top-10 h-40 w-40 rounded-full bg-slate-400/10 blur-3xl transition-opacity group-hover:opacity-100" />
+                  <div className="pointer-events-none absolute -bottom-10 left-1/4 h-32 w-32 rounded-full bg-blue-300/10 blur-3xl" />
+                  <div className="absolute inset-0 bg-gradient-to-br from-slate-50/70 to-slate-100/60 opacity-60 transition-opacity group-hover:opacity-100" />
                   <div className="relative z-10 flex h-16 w-16 items-center justify-center rounded-2xl bg-white shadow-sm ring-1 ring-slate-100 transition-transform group-hover:scale-105">
                     {SUGGESTIONS[0].icon}
                   </div>
                   <div className="relative z-10 mt-auto pt-12">
-                    <span className="text-xl font-bold text-slate-800 transition-colors group-hover:text-orange-600">
+                    <span className="text-xl font-bold text-slate-800 transition-colors group-hover:text-slate-900">
                       {SUGGESTIONS[0].text}
                     </span>
                     <p className="mt-2 text-[15px] font-medium text-[#8A93A6]">
@@ -1731,17 +1796,17 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                       onClick={() => handleSend(item.text)}
                       className="group relative flex flex-1 items-center justify-between overflow-hidden rounded-[20px] bg-white/88 px-6 py-5 text-left shadow-[0_8px_30px_-12px_rgba(15,23,42,0.08)] border border-white/70 backdrop-blur-xl transition-all duration-300 hover:-translate-x-1 hover:shadow-[0_12px_40px_-4px_rgba(0,0,0,0.08)]"
                     >
-                      <div className="pointer-events-none absolute -right-4 -top-4 h-24 w-24 rounded-full bg-orange-400/5 blur-2xl transition-opacity group-hover:opacity-100" />
+                      <div className="pointer-events-none absolute -right-4 -top-4 h-24 w-24 rounded-full bg-slate-400/10 blur-2xl transition-opacity group-hover:opacity-100" />
                       <div className="flex items-center gap-4 relative z-10">
-                        <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-slate-50 text-slate-600 transition-colors group-hover:bg-orange-50 group-hover:text-orange-500">
+                        <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-slate-50 text-slate-600 transition-colors group-hover:bg-slate-100 group-hover:text-slate-800">
                           {item.icon}
                         </div>
                         <span className="text-[16px] font-bold text-slate-700 transition-colors group-hover:text-slate-900">
                           {item.text}
                         </span>
                       </div>
-                      <div className="flex h-8 w-8 items-center justify-center rounded-full bg-slate-50 transition-colors group-hover:bg-orange-100 relative z-10">
-                        <ChevronRight className="h-4 w-4 text-slate-400 transition-transform group-hover:translate-x-0.5 group-hover:text-orange-600" />
+                      <div className="flex h-8 w-8 items-center justify-center rounded-full bg-slate-50 transition-colors group-hover:bg-slate-100 relative z-10">
+                        <ChevronRight className="h-4 w-4 text-slate-400 transition-transform group-hover:translate-x-0.5 group-hover:text-slate-700" />
                       </div>
                     </button>
                   ))}
@@ -1751,13 +1816,13 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
           ) : (
             // Chat Stream
             <div className="space-y-8">
-              {messages.map((msg, idx) => (
+              {visibleMessages.map((msg, idx) => (
                 <div key={`${msg.role}-${idx}`} className={`flex w-full ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                   {msg.role === 'user' ? (
-                    <div className="max-w-[85%] rounded-[24px] rounded-br-sm bg-orange-500 px-6 py-4 text-white shadow-md shadow-orange-200/50 transition-all duration-300 animate-in fade-in slide-in-from-bottom-2">
-                      <p className="whitespace-pre-wrap text-[15px] leading-relaxed font-medium">{msg.content}</p>
+                    <div className="max-w-[85%] rounded-[20px] rounded-br-sm border border-slate-200 bg-slate-100 px-5 py-3.5 text-slate-900 shadow-sm transition-all duration-300 animate-in fade-in slide-in-from-bottom-2">
+                      <p className="whitespace-pre-wrap text-[15px] leading-relaxed">{msg.content}</p>
                       {msg.image && (
-                        <img src={msg.image} alt="upload" className="mt-4 max-h-64 rounded-xl border border-white/20 object-contain shadow-sm bg-white/10 backdrop-blur-sm" />
+                        <img src={msg.image} alt="upload" className="mt-4 max-h-64 rounded-xl border border-slate-200 object-contain shadow-sm bg-white" />
                       )}
                     </div>
                   ) : (
@@ -1773,19 +1838,19 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                               className="group flex w-full items-center justify-between px-5 py-3 text-sm font-semibold text-slate-600 transition-colors"
                             >
                               <div className="flex items-center gap-2.5">
-                                {sending && idx === messages.length - 1 && (!msg.content || msg.content === '正在思考...' || msg.content === '正在分析中...') ? (
+                                {sending && idx === visibleMessages.length - 1 && (!msg.content || msg.content === '正在思考...' || msg.content === '正在分析中...') ? (
                                   <>
-                                    <div className="flex h-6 w-6 items-center justify-center rounded-full bg-orange-50 text-orange-600">
+                                    <div className="flex h-6 w-6 items-center justify-center rounded-full bg-slate-100 text-slate-600">
                                       <Loader2 className="h-3.5 w-3.5 animate-spin" />
                                     </div>
-                                    <span className="bg-gradient-to-r from-orange-500 to-amber-500 bg-clip-text text-transparent">正在深度思考...</span>
+                                    <span className="text-slate-700">正在深度思考...</span>
                                   </>
                                 ) : (
                                   <>
-                                    <div className="flex h-6 w-6 items-center justify-center rounded-full bg-slate-100 text-slate-500 group-hover:bg-orange-50 group-hover:text-orange-600 transition-colors">
+                                    <div className="flex h-6 w-6 items-center justify-center rounded-full bg-slate-100 text-slate-500 group-hover:bg-slate-200 group-hover:text-slate-700 transition-colors">
                                       <BrainCircuit className="h-3.5 w-3.5" />
                                     </div>
-                                    <span className="group-hover:text-orange-600 transition-colors">{expandedThinking[idx] ? '深度思考过程' : '已完成深度思考'}</span>
+                                    <span className="group-hover:text-slate-700 transition-colors">{expandedThinking[idx] ? '深度思考过程' : '已完成深度思考'}</span>
                                   </>
                                 )}
                               </div>
@@ -1808,12 +1873,12 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                             )}
                           </div>
                         )}
-                        {(msg.content === '正在思考...' || msg.content === '正在分析中...' || (sending && idx === messages.length - 1 && !String(msg.content || '').trim())) ? (
-                          <div className="flex items-center gap-3 text-orange-600 font-bold text-[15px] py-2">
-                            <div className="flex h-8 w-8 items-center justify-center rounded-full bg-orange-50">
+                        {(msg.content === '正在思考...' || msg.content === '正在分析中...' || (sending && idx === visibleMessages.length - 1 && !String(msg.content || '').trim())) ? (
+                          <div className="flex items-center gap-3 text-slate-700 font-semibold text-[15px] py-2">
+                            <div className="flex h-8 w-8 items-center justify-center rounded-full bg-slate-100">
                               <Loader2 className="w-4 h-4 animate-spin" />
                             </div>
-                            {(sending && idx === messages.length - 1 && !String(msg.content || '').trim()) ? '正在整理入库卡片...' : msg.content}
+                            {(sending && idx === visibleMessages.length - 1 && !String(msg.content || '').trim()) ? '正在整理入库卡片...' : msg.content}
                           </div>
                         ) : (
                           <div className="prose prose-sm md:prose-base prose-slate max-w-none leading-relaxed text-slate-800 break-words">
@@ -1821,6 +1886,10 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                               {msg.content}
                             </ReactMarkdown>
                           </div>
+                        )}
+
+                        {msg.action?.type === 'render_inline_quiz' && msg.action.payload && (
+                          <InlineQuizCard payload={msg.action.payload as any} />
                         )}
                         
                         {msg.isError && (
@@ -1831,7 +1900,7 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                                 setMessages(prev => prev.slice(0, -2));
                                 handleSend(msg.originalAsk);
                               }}
-                              className="text-sm font-medium text-orange-600 hover:text-orange-700 hover:underline flex items-center gap-1"
+                              className="text-sm font-medium text-slate-700 hover:text-slate-900 hover:underline flex items-center gap-1"
                             >
                               <Sparkles className="w-3.5 h-3.5" />
                               重新发送
@@ -1839,8 +1908,8 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                           </div>
                         )}
 
-                        {msg.action && !(shouldHideRouteEntrances && (msg.action.type === 'start_review' || msg.action.type === 'start_drill')) && (
-                          <div className="mt-6 overflow-hidden rounded-[24px] border border-slate-200 bg-white shadow-sm transition-all hover:border-orange-300 hover:shadow-md">
+                        {msg.action && msg.action.type !== 'render_inline_quiz' && !(shouldHideRouteEntrances && (msg.action.type === 'start_review' || msg.action.type === 'start_drill')) && (
+                          <div className="mt-6 overflow-hidden rounded-[24px] border border-slate-200 bg-white shadow-sm transition-all hover:border-slate-300 hover:shadow-md">
                             <div className="border-b border-slate-100 bg-slate-50/80 px-6 py-4 flex items-center justify-between">
                               <div>
                                 <p className="text-[15px] font-bold text-slate-900">{msg.action.title || 'AI 解析结果'}</p>
@@ -1877,12 +1946,12 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                                   return (
                                     <>
                                       {totalBatches > 1 && (
-                                        <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-indigo-100 bg-white px-3 py-2">
-                                          <p className="text-xs font-medium text-indigo-700">
+                                        <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-blue-100 bg-white px-3 py-2">
+                                          <p className="text-xs font-medium text-blue-700">
                                             共 {msg.drafts.length} 题，已按知识点分组，共 {totalBatches} 组
                                           </p>
                                           <div className="flex items-center gap-2">
-                                            <span className="rounded-md bg-indigo-50 px-2 py-1 text-[11px] font-medium text-indigo-700">
+                                            <span className="rounded-md bg-blue-50 px-2 py-1 text-[11px] font-medium text-blue-700">
                                               已入库 {completedBatches}/{totalBatches} 批
                                             </span>
                                             {allCompleted && (
@@ -1902,14 +1971,14 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                                                   setBatchDisplayMode(prev => ({ ...prev, [idx]: 'paged' }));
                                                   focusBatch(idx, activeBatch);
                                                 }}
-                                                className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${batchMode === 'paged' ? 'bg-indigo-600 text-white' : 'text-gray-700 hover:bg-gray-50'}`}
+                                                className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${batchMode === 'paged' ? 'bg-blue-600 text-white' : 'text-gray-700 hover:bg-gray-50'}`}
                                               >
                                                 分页查看（按知识点）
                                               </button>
                                               <button
                                                 type="button"
                                                 onClick={() => setBatchDisplayMode(prev => ({ ...prev, [idx]: 'all' }))}
-                                                className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${batchMode === 'all' ? 'bg-indigo-600 text-white' : 'text-gray-700 hover:bg-gray-50'}`}
+                                                className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${batchMode === 'all' ? 'bg-blue-600 text-white' : 'text-gray-700 hover:bg-gray-50'}`}
                                               >
                                                 一次性展示全部
                                               </button>
@@ -1948,9 +2017,9 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                                         </div>
                                       )}
                                       {totalBatches <= 1 && (
-                                        <div className="flex items-center justify-between gap-3 rounded-xl border border-indigo-100 bg-white px-3 py-2">
-                                          <p className="text-xs font-medium text-indigo-700">共 {msg.drafts.length} 题，可直接在上方统一执行</p>
-                                          <span className="rounded-md bg-indigo-50 px-2 py-1 text-[11px] font-medium text-indigo-700">
+                                        <div className="flex items-center justify-between gap-3 rounded-xl border border-blue-100 bg-white px-3 py-2">
+                                          <p className="text-xs font-medium text-blue-700">共 {msg.drafts.length} 题，可直接在上方统一执行</p>
+                                          <span className="rounded-md bg-blue-50 px-2 py-1 text-[11px] font-medium text-blue-700">
                                             待确认 {msg.drafts.length} 题
                                           </span>
                                         </div>
@@ -1971,11 +2040,11 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                                           本批会先按标签桶处理。命中现有标签的分桶会显示标签上下文；待创建标签和待确认知识点分桶需要先处理后才能正式写入。
                                         </p>
                                       </div>
-                                      <div className="rounded-2xl border border-indigo-200 bg-white px-4 py-4 shadow-sm">
+                                      <div className="rounded-2xl border border-blue-200 bg-white px-4 py-4 shadow-sm">
                                         <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
                                           <div className="space-y-2">
                                             <div className="flex flex-wrap items-center gap-2 text-[11px] font-medium">
-                                              <span className="rounded-full bg-indigo-100 px-2.5 py-1 text-indigo-700">
+                                              <span className="rounded-full bg-blue-100 px-2.5 py-1 text-blue-700">
                                                 候选新增错题 {msg.drafts.length} 道
                                               </span>
                                               <span className="rounded-full bg-emerald-100 px-2.5 py-1 text-emerald-700">
@@ -2016,12 +2085,12 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                                             }}
                                             className={`rounded-2xl px-6 py-3 text-sm font-bold text-white transition-all duration-300 shadow-sm w-full sm:w-auto ${
                                               bulkExecuting || isPreflightingBatch
-                                                ? 'bg-indigo-400 cursor-wait'
+                                                ? 'bg-blue-400 cursor-wait'
                                                 : completedBatches >= totalBatches
                                                 ? 'bg-emerald-500 cursor-default'
                                                 : unresolvedGroups.length > 0 || readyGroups.length === 0
                                                 ? 'bg-slate-300 cursor-not-allowed'
-                                                : 'bg-indigo-600 hover:bg-indigo-500 hover:shadow-md hover:shadow-indigo-200 active:scale-95'
+                                                : 'bg-blue-600 hover:bg-blue-500 hover:shadow-md hover:shadow-blue-200 active:scale-95'
                                             }`}
                                           >
                                             {completedBatches >= totalBatches
@@ -2056,14 +2125,14 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                                       ref={(node) => {
                                         batchCardRefs.current[batchKey] = node;
                                       }}
-                                      className={`overflow-hidden rounded-2xl border bg-indigo-50/20 transition-all animate-in fade-in duration-300 ${highlightedBatchKey === batchKey ? 'border-indigo-400 shadow-lg shadow-indigo-100' : 'border-indigo-100'}`}
+                                      className={`overflow-hidden rounded-2xl border bg-blue-50/20 transition-all animate-in fade-in duration-300 ${highlightedBatchKey === batchKey ? 'border-blue-400 shadow-lg shadow-blue-100' : 'border-blue-100'}`}
                                     >
-                                      <div className="flex items-center justify-between border-b border-indigo-100 px-4 py-3">
-                                        <div>
-                                          <p className="text-sm font-semibold text-indigo-900">{totalBatches > 1 ? `待确认分组 ${batchIdx + 1}` : '待确认入库清单'}</p>
-                                          <p className="text-xs text-indigo-600/80">{totalBatches > 1 ? `分桶：${draftGroup.label}，共 ${draftBatch.length} 题` : `共 ${draftBatch.length} 题，确认后将一次性全部入库`}</p>
+                                      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-blue-100 px-4 py-3">
+                                        <div className="min-w-0 flex-1">
+                                          <p className="text-sm font-semibold text-blue-900 truncate">{totalBatches > 1 ? `待确认分组 ${batchIdx + 1}` : '待确认入库清单'}</p>
+                                          <p className="text-xs text-blue-600/80 truncate mt-0.5">{totalBatches > 1 ? `分桶：${draftGroup.label}，共 ${draftBatch.length} 题` : `共 ${draftBatch.length} 题，确认后将一次性全部入库`}</p>
                                         </div>
-                                        <div className="flex items-center gap-2">
+                                        <div className="flex flex-wrap items-center gap-2 shrink-0">
                                           <span className={`rounded-full px-3 py-1 text-[11px] font-medium shadow-sm ${
                                             draftGroup.status === 'ready'
                                               ? 'bg-emerald-100 text-emerald-700'
@@ -2073,7 +2142,7 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                                           }`}>
                                             {draftGroup.status === 'ready' ? '已命中标签桶' : draftGroup.status === 'pending_tag' ? '待创建标签桶' : '待确认分桶'}
                                           </span>
-                                          <span className="rounded-full bg-white px-3 py-1 text-[11px] font-medium text-indigo-700 shadow-sm">AI 先建议，你来定稿</span>
+                                          <span className="rounded-full bg-white px-3 py-1 text-[11px] font-medium text-blue-700 shadow-sm hidden sm:inline-flex">AI 先建议，你来定稿</span>
                                         </div>
                                       </div>
                                       <div className="flex flex-col gap-4 p-4">
@@ -2096,10 +2165,10 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                                             </div>
                                           )}
                                         </div>
-                                        {draftBatchRaw.map(({ draft, absoluteIdx }, localIdx) => {
+                                        {draftBatchRaw.map(({ draft, absoluteIdx }) => {
                                           const editKey = `${idx}-${absoluteIdx}`;
                                           const mergedDraft = getMergedDraft(draft as DraftQuestion, editKey);
-                                          const parsedOriginalQuestion = parseQuestionPreview(String(draft.question_text || ''));
+                                          const parsedOriginalQuestion = parseQuestionPreview(String(mergedDraft.question_text || ''));
                                           const optionLines = getDraftOptionLines(mergedDraft);
                                           const previewQuestionText = buildDraftPreviewText(mergedDraft);
                                           const subject = String(mergedDraft.subject || '英语');
@@ -2107,14 +2176,14 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                                           const knowledgePoint = getSelectableValue(typeof mergedDraft.knowledge_point === 'string' ? mergedDraft.knowledge_point : undefined, knowledgeOptions);
                                           const questionText = typeof draftEdits[editKey]?.question_text === 'string'
                                             ? String(draftEdits[editKey]?.question_text || '')
-                                            : (parsedOriginalQuestion.options.length > 0 ? parsedOriginalQuestion.stem : String(draft.question_text || ''));
+                                            : (parsedOriginalQuestion.options.length > 0 ? parsedOriginalQuestion.stem : String(mergedDraft.question_text || ''));
                                           const correctAnswer = String(mergedDraft.correct_answer || '');
                                           const note = String(mergedDraft.note || '');
-                                          const aiKnowledgePoint = String(draft.knowledge_point || '');
+                                          const aiKnowledgePoint = String(mergedDraft.knowledge_point || '');
                                           const sc = getSubjectColor(subject as any);
 
                                           return (
-                                            <div key={editKey} className="overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-sm transition-all hover:border-indigo-300">
+                                            <div key={editKey} className="overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-sm transition-all hover:border-blue-300">
                                               <div className="p-5">
                                                 <div className="mb-4 flex items-center gap-1.5 flex-wrap">
                                                   <span className={`text-[11px] px-2 py-0.5 rounded-md font-semibold ${sc.bg} ${sc.text}`}>{subject}</span>
@@ -2131,16 +2200,16 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                                                   showResultComparison={Boolean(correctAnswer)}
                                                 />
 
-                                                {draft.image_url && (
+                                                {mergedDraft.image_url && (
                                                   <div className="mt-4 rounded-xl overflow-hidden border border-gray-100 flex justify-center items-center min-h-[100px] bg-gray-50/50 p-2">
-                                                    <img src={draft.image_url} alt="Question" className="max-h-64 object-contain rounded-lg" loading="lazy" />
+                                                    <img src={mergedDraft.image_url} alt="Question" className="max-h-64 object-contain rounded-lg" loading="lazy" />
                                                   </div>
                                                 )}
 
-                                                {draft.note && (
+                                                {mergedDraft.note && (
                                                   <div className="mt-5 rounded-xl border border-blue-100/50 bg-blue-50/50 p-4">
                                                     <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-blue-600">AI 原始解析</p>
-                                                    <p className="text-[13px] leading-relaxed text-blue-900 whitespace-pre-wrap">{draft.note}</p>
+                                                    <p className="text-[13px] leading-relaxed text-blue-900 whitespace-pre-wrap">{mergedDraft.note}</p>
                                                   </div>
                                                 )}
 
@@ -2152,7 +2221,7 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                                                   <label className="flex flex-col gap-1.5">
                                                     <span className="text-[11px] font-medium text-gray-500">科目</span>
                                                     <Select value={toSelectValue(subject)} onValueChange={val => updateDraftEdits(editKey, { subject: fromSelectValue(val), knowledge_point: '' })}>
-                                                      <SelectTrigger className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-xs outline-none transition-all focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 shadow-sm w-full h-auto">
+                                                      <SelectTrigger className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-xs outline-none transition-all focus:border-blue-400 focus:ring-2 focus:ring-blue-100 shadow-sm w-full h-auto">
                                                         <SelectValue placeholder="请选择科目" />
                                                       </SelectTrigger>
                                                       <SelectContent>
@@ -2164,7 +2233,7 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                                                   <label className="flex flex-col gap-1.5">
                                                     <span className="text-[11px] font-medium text-gray-500">主知识点</span>
                                                     <Select value={toSelectValue(knowledgePoint)} onValueChange={val => updateDraftEdits(editKey, { knowledge_point: fromSelectValue(val) })}>
-                                                      <SelectTrigger className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-xs outline-none transition-all focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 shadow-sm w-full h-auto">
+                                                      <SelectTrigger className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-xs outline-none transition-all focus:border-blue-400 focus:ring-2 focus:ring-blue-100 shadow-sm w-full h-auto">
                                                         <SelectValue placeholder="请选择题库标签" />
                                                       </SelectTrigger>
                                                       <SelectContent>
@@ -2193,7 +2262,7 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                                                               toast.error(error?.message || '创建标签失败');
                                                             }
                                                           }}
-                                                          className="rounded-md border border-indigo-200 bg-indigo-50 px-2 py-0.5 text-[11px] font-medium text-indigo-700 transition-colors hover:bg-indigo-100"
+                                                          className="rounded-md border border-blue-200 bg-blue-50 px-2 py-0.5 text-[11px] font-medium text-blue-700 transition-colors hover:bg-blue-100"
                                                         >
                                                           一键创建并选中
                                                         </button>
@@ -2209,7 +2278,7 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                                                       value={questionText}
                                                       onChange={e => updateDraftEdits(editKey, { question_text: e.target.value })}
                                                       rows={4}
-                                                      className="rounded-2xl border border-gray-200 bg-white px-3 py-2.5 text-sm text-gray-700 outline-none transition-all focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 shadow-sm resize-y"
+                                                      className="rounded-2xl border border-gray-200 bg-white px-3 py-2.5 text-sm text-gray-700 outline-none transition-all focus:border-blue-400 focus:ring-2 focus:ring-blue-100 shadow-sm resize-y"
                                                     />
                                                   </label>
                                                   {optionLines.length > 0 && (
@@ -2252,7 +2321,7 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                                                                   nextOptions[optionIdx] = `${optionLabel}. ${e.target.value}`;
                                                                   updateDraftEdits(editKey, { options: nextOptions });
                                                                 }}
-                                                                className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-xs outline-none transition-all focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 shadow-sm"
+                                                                className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-xs outline-none transition-all focus:border-blue-400 focus:ring-2 focus:ring-blue-100 shadow-sm"
                                                               />
                                                             </label>
                                                           );
@@ -2266,7 +2335,7 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                                                       <input
                                                         value={correctAnswer}
                                                         onChange={e => updateDraftEdits(editKey, { correct_answer: e.target.value })}
-                                                        className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-xs outline-none transition-all focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 shadow-sm"
+                                                        className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-xs outline-none transition-all focus:border-blue-400 focus:ring-2 focus:ring-blue-100 shadow-sm"
                                                       />
                                                     </label>
                                                   </div>
@@ -2276,7 +2345,7 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                                                       value={note}
                                                       onChange={e => updateDraftEdits(editKey, { note: e.target.value })}
                                                       rows={4}
-                                                      className="rounded-2xl border border-gray-200 bg-white px-3 py-2.5 text-sm text-gray-700 outline-none transition-all focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 shadow-sm resize-y"
+                                                      className="rounded-2xl border border-gray-200 bg-white px-3 py-2.5 text-sm text-gray-700 outline-none transition-all focus:border-blue-400 focus:ring-2 focus:ring-blue-100 shadow-sm resize-y"
                                                     />
                                                   </label>
                                                 </div>
@@ -2302,16 +2371,7 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                                             </div>
                                             <div className="space-y-3">
                                               {groupKnowledgeUpdates.map((update, localIdx) => {
-                                                const existingMarkdown = readLearningContentState().drawerByTag[update.tag]?.markdown || '';
-                                                const preview = mergeLearningDrawerContent(readLearningContentState().drawerByTag[update.tag], {
-                                                  targetNode: update.tag,
-                                                  note: update.note,
-                                                  markdown: update.markdown,
-                                                  reason: update.reason,
-                                                  decision: update.decision,
-                                                  source: 'ai_update',
-                                                });
-                                                const previewLabel = preview.decision === 'create' ? '建议新增' : preview.decision === 'rewrite' ? '建议改写' : '无需更新';
+                                                const preview = buildKnowledgeUpdatePreviewModel(update, readLearningContentState().drawerByTag, String(draftBatch[0]?.subject || '英语') === 'C语言' ? 'C语言' : '英语');
                                                 return (
                                                   <div key={`${knowledgeActionKey}-${localIdx}`} className="overflow-hidden rounded-2xl border border-emerald-100 bg-white shadow-sm">
                                                     <div className="border-b border-emerald-50 bg-emerald-50/50 px-4 py-3 flex items-center justify-between">
@@ -2319,15 +2379,15 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                                                         <Hash className="w-4 h-4 text-emerald-500" />
                                                         {update.tag}
                                                       </span>
-                                                      <span className="text-[11px] text-emerald-600 bg-emerald-100/50 px-2 py-0.5 rounded-md font-medium">{previewLabel}</span>
+                                                      <span className="text-[11px] text-emerald-600 bg-emerald-100/50 px-2 py-0.5 rounded-md font-medium">{preview.previewLabel}</span>
                                                     </div>
                                                     <div className="p-5 space-y-3">
                                                       <div className="rounded-xl border border-emerald-100 bg-emerald-50/40 px-3 py-2 text-xs leading-relaxed text-emerald-800">
                                                         {preview.reason}
                                                       </div>
                                                       <KnowledgeUpdatePreview
-                                                        existingMarkdown={existingMarkdown}
-                                                        suggestedMarkdown={String(preview.drawer.markdown || update.markdown || '')}
+                                                        existingMarkdown={preview.existingMarkdown}
+                                                        suggestedMarkdown={preview.suggestedMarkdown}
                                                         decision={preview.decision}
                                                       />
                                                     </div>
@@ -2341,11 +2401,11 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                                                     if (executingKey === knowledgeActionKey || executedActions[knowledgeActionKey]) return;
                                                     setExecutingKey(knowledgeActionKey);
                                                     try {
-                                                      const { updatedCount, skippedCount } = applyKnowledgeUpdates(groupKnowledgeUpdates);
+                                                      const { updatedCount, skippedCount, createdTags } = await applyKnowledgeUpdates(groupKnowledgeUpdates);
                                                       if (updatedCount > 0 && skippedCount > 0) {
-                                                        toast.success(`知识点「${draftGroup.label}」已更新 ${updatedCount} 项，另有 ${skippedCount} 项无需更新`);
+                                                        toast.success(`知识点「${draftGroup.label}」已更新 ${updatedCount} 项，另有 ${skippedCount} 项无需更新${createdTags.length > 0 ? `，已创建 ${createdTags.length} 个新标签` : ''}`);
                                                       } else if (updatedCount > 0) {
-                                                        toast.success(`知识点「${draftGroup.label}」已完成更新`);
+                                                        toast.success(`知识点「${draftGroup.label}」已完成更新${createdTags.length > 0 ? `，并创建 ${createdTags.length} 个新标签` : ''}`);
                                                       } else {
                                                         toast.success(`知识点「${draftGroup.label}」当前无需更新`);
                                                       }
@@ -2420,8 +2480,8 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                                           )}
                                         </div>
                                         {batchMode === 'paged' && totalBatches > 1 && (
-                                          <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-indigo-100 bg-white/80 px-4 py-3">
-                                            <p className="text-xs font-medium text-indigo-700">
+                                          <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-blue-100 bg-white/80 px-4 py-3">
+                                            <p className="text-xs font-medium text-blue-700">
                                               当前第 {batchIdx + 1}/{totalBatches} 组 · {draftGroup.label}
                                             </p>
                                             <div className="flex items-center gap-2">
@@ -2457,16 +2517,7 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                             {msg.knowledgeUpdates && msg.knowledgeUpdates.length > 0 && (!msg.drafts || msg.drafts.length === 0) && (
                               <div className="flex flex-col gap-4 p-4 bg-emerald-50/20">
                                 {msg.knowledgeUpdates.map((update, localIdx) => {
-                                  const existingMarkdown = readLearningContentState().drawerByTag[update.tag]?.markdown || '';
-                                  const preview = mergeLearningDrawerContent(readLearningContentState().drawerByTag[update.tag], {
-                                    targetNode: update.tag,
-                                    note: update.note,
-                                    markdown: update.markdown,
-                                    reason: update.reason,
-                                    decision: update.decision,
-                                    source: 'ai_update',
-                                  });
-                                  const previewLabel = preview.decision === 'create' ? '建议新增' : preview.decision === 'rewrite' ? '建议改写' : '无需更新';
+                                  const preview = buildKnowledgeUpdatePreviewModel(update, readLearningContentState().drawerByTag);
                                   return (
                                     <div key={`${idx}-${localIdx}`} className="overflow-hidden rounded-2xl border border-emerald-100 bg-white shadow-sm transition-all hover:border-emerald-300">
                                       <div className="border-b border-emerald-50 bg-emerald-50/50 px-4 py-3 flex items-center justify-between">
@@ -2474,15 +2525,15 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                                           <Hash className="w-4 h-4 text-emerald-500" />
                                           {update.tag}
                                         </span>
-                                        <span className="text-[11px] text-emerald-600 bg-emerald-100/50 px-2 py-0.5 rounded-md font-medium">{previewLabel}</span>
+                                        <span className="text-[11px] text-emerald-600 bg-emerald-100/50 px-2 py-0.5 rounded-md font-medium">{preview.previewLabel}</span>
                                       </div>
                                       <div className="p-5 space-y-3">
                                         <div className="rounded-xl border border-emerald-100 bg-emerald-50/40 px-3 py-2 text-xs leading-relaxed text-emerald-800">
                                           {preview.reason}
                                         </div>
                                         <KnowledgeUpdatePreview
-                                          existingMarkdown={existingMarkdown}
-                                          suggestedMarkdown={String(preview.drawer.markdown || update.markdown || '')}
+                                          existingMarkdown={preview.existingMarkdown}
+                                          suggestedMarkdown={preview.suggestedMarkdown}
                                           decision={preview.decision}
                                         />
                                       </div>
@@ -2498,12 +2549,12 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
 
                                       setExecutingKey(actionKey);
                                       try {
-                                        const { updatedCount, skippedCount } = applyKnowledgeUpdates(msg.knowledgeUpdates);
+                                        const { updatedCount, skippedCount, createdTags } = await applyKnowledgeUpdates(msg.knowledgeUpdates);
                                         if (updatedCount > 0 || skippedCount > 0) {
                                           if (updatedCount > 0 && skippedCount > 0) {
-                                            toast.success(`已更新 ${updatedCount} 个知识点，另有 ${skippedCount} 个无需更新`);
+                                            toast.success(`已更新 ${updatedCount} 个知识点，另有 ${skippedCount} 个无需更新${createdTags.length > 0 ? `，并创建 ${createdTags.length} 个新标签` : ''}`);
                                           } else if (updatedCount > 0) {
-                                            toast.success(`已更新 ${updatedCount} 个知识点内容`);
+                                            toast.success(`已更新 ${updatedCount} 个知识点内容${createdTags.length > 0 ? `，并创建 ${createdTags.length} 个新标签` : ''}`);
                                           } else {
                                             toast.success(`本次 ${skippedCount} 个知识点均无需更新`);
                                           }
@@ -2548,7 +2599,7 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                                       setExecutingKey(actionKey);
                                       try {
                                         const result = await executeAction(msg.action!, undefined, { mode: msg.mode });
-                                        if (msg.action!.type === 'create_mistake' && result) {
+                                        if (msg.action!.type === 'create_mistake' && result && 'insertedCount' in result) {
                                           if (result.duplicateCount > 0) {
                                             toast.success(`已存入 ${result.insertedCount} 道错题，跳过 ${result.duplicateCount} 道相似题`);
                                           } else {
@@ -2568,8 +2619,8 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                                       executedActions[getActionKey(idx)]
                                         ? 'bg-emerald-500 cursor-default'
                                         : executingKey === getActionKey(idx)
-                                        ? 'bg-indigo-400 cursor-wait'
-                                        : 'bg-slate-900 hover:bg-indigo-600 hover:shadow-md hover:shadow-indigo-200 active:scale-95'
+                                        ? 'bg-blue-400 cursor-wait'
+                                        : 'bg-slate-900 hover:bg-blue-600 hover:shadow-md hover:shadow-blue-200 active:scale-95'
                                     }`}
                                   >
                                     {executedActions[getActionKey(idx)] ? (
@@ -2614,65 +2665,7 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
             </div>
           )}
           
-          <div className="mb-4 flex flex-wrap items-center justify-center gap-3">
-            <div className="flex flex-wrap items-center justify-center gap-2">
-              {CAPABILITY_ORDER.map((capability) => {
-                const meta = getCopilotCapabilityMeta(capability);
-                const active = capability === currentCapability && modeSelectionSource === 'manual';
-                const modeEmoji = capability === 'organize'
-                  ? '📸'
-                  : capability === 'explain'
-                    ? '💡'
-                    : capability === 'recommend'
-                      ? '📅'
-                      : '🎯';
-                return (
-                  <button
-                    key={capability}
-                    type="button"
-                    onClick={() => handleModeSelect(capability)}
-                    className={`relative flex items-center gap-1.5 rounded-full px-4 py-1.5 text-xs font-bold transition-all duration-300 shadow-sm ${
-                      active
-                        ? 'bg-orange-50 text-orange-600 border border-orange-500/50 shadow-orange-200/30'
-                        : 'bg-slate-100 text-slate-600 hover:bg-slate-200 hover:text-slate-900 border border-slate-200/50'
-                    }`}
-                  >
-                    <span className="text-sm drop-shadow-sm">{modeEmoji}</span>
-                    {meta.label}
-                  </button>
-                );
-              })}
-              <button
-                type="button"
-                onClick={handleAutoMode}
-                className={`relative flex items-center gap-1.5 rounded-full px-4 py-1.5 text-xs font-bold transition-all duration-300 shadow-sm ${
-                  modeSelectionSource === 'auto'
-                    ? 'bg-indigo-50 text-indigo-600 border border-indigo-500/50 shadow-indigo-200/30'
-                    : 'bg-slate-100 text-slate-600 hover:bg-slate-200 hover:text-slate-900 border border-slate-200/50'
-                }`}
-              >
-                <span className="text-sm drop-shadow-sm">✨</span>
-                自动识别
-              </button>
-            </div>
-            
-            <div className="flex items-center gap-2 rounded-full bg-white/80 backdrop-blur-sm px-3 py-1.5 shadow-sm border border-white">
-              <span className="flex items-center gap-1.5 rounded-full bg-orange-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-orange-600">
-                <div className="h-1.5 w-1.5 rounded-full bg-orange-500 animate-pulse" />
-                {currentCapabilityMeta.label}
-              </span>
-              <span className="text-[11px] font-medium text-slate-500">
-                {modeSelectionSource === 'manual' ? '当前按你的手动选择执行' : currentCapabilityMeta.defaultAction}
-              </span>
-            </div>
-          </div>
-          
-          <div className="relative flex items-end gap-2 rounded-[32px] border border-white bg-white/80 p-2 shadow-[0_8px_30px_-4px_rgba(0,0,0,0.06)] backdrop-blur-xl transition-all duration-300 focus-within:border-orange-300 focus-within:shadow-[0_12px_40px_-4px_rgba(249,115,22,0.15)] focus-within:bg-white">
-            <label className="group flex h-12 w-12 shrink-0 cursor-pointer items-center justify-center rounded-full text-slate-400 transition-colors hover:bg-orange-50 hover:text-orange-500">
-              <span className="text-[20px] drop-shadow-sm transition-transform group-hover:scale-110">📸</span>
-              <input type="file" accept="image/*" className="hidden" onChange={e => handleUpload(e.target.files?.[0] || null)} />
-            </label>
-            
+          <div className="relative mx-auto w-[92%] flex flex-col gap-2 rounded-2xl border border-gray-200 bg-white p-2 shadow-sm transition-all duration-200 focus-within:border-blue-400 focus-within:shadow-sm focus-within:ring-2 focus-within:ring-blue-50">
             <textarea
               ref={textareaRef}
               value={input}
@@ -2680,7 +2673,7 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
               onKeyDown={handleKeyDown}
               onPaste={handlePaste}
               rows={1}
-              className="max-h-32 min-h-[48px] flex-1 resize-none bg-transparent py-3.5 text-[16px] font-medium text-slate-900 outline-none placeholder:text-slate-400 placeholder:font-normal leading-relaxed"
+              className="min-h-[32px] max-h-40 w-full resize-none bg-transparent px-1.5 py-1 text-[13px] leading-snug text-gray-900 outline-none placeholder:text-gray-400"
               placeholder={currentCapability === 'launch'
                 ? '描述你准备开始的练习或复习范围...'
                 : currentCapability === 'recommend'
@@ -2690,40 +2683,89 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                     : '输入题目、错因，或上传图片...'}
             />
             
-            <div className="flex shrink-0 items-center gap-2 pr-1 pb-1">
-              <button
-                onClick={() => setDeepThinking(!deepThinking)}
-                className={`group flex h-10 px-4 items-center justify-center rounded-full transition-all text-sm font-bold tracking-wide ${
-                  deepThinking
-                    ? 'text-indigo-600 bg-indigo-50/50 border border-indigo-200/60 hover:bg-indigo-50'
-                    : 'text-slate-400 bg-transparent hover:bg-slate-50 hover:text-slate-600 border border-transparent'
-                }`}
-                title={deepThinking ? "已开启深度思考" : "开启深度思考"}
-              >
-                <span className={`text-[15px] ${deepThinking ? 'mr-1.5' : ''} transition-transform group-hover:scale-110`}>🧠</span>
-                {deepThinking && <span>深度思考</span>}
-              </button>
-
-              {sending ? (
+            <div className="flex items-center justify-between mt-1">
+              <div className="flex items-center gap-2">
+                <label className="flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-full text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-700">
+                  <ImagePlus className="h-4.5 w-4.5" />
+                  <input type="file" accept="image/*" className="hidden" onChange={e => handleUpload(e.target.files?.[0] || null)} />
+                </label>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {COPILOT_MODES.map((mode) => {
+                    const meta = getCopilotCapabilityMeta(mode);
+                    const active = mode === currentCapability;
+                    const modeEmoji = mode === 'organize'
+                      ? '📸'
+                      : mode === 'explain'
+                        ? '💡'
+                        : mode === 'recommend'
+                          ? '📅'
+                          : '🎯';
+                    return (
+                      <button
+                        key={mode}
+                        type="button"
+                        onClick={() => handleModeSelect(mode)}
+                        className={`relative flex items-center gap-1 rounded-full px-2.5 py-1 text-[11px] font-bold transition-all duration-300 shadow-sm ${
+                          active
+                            ? 'bg-emerald-50 text-emerald-700 border border-emerald-500/40 shadow-emerald-200/30'
+                            : 'bg-slate-100 text-slate-600 hover:bg-slate-200 hover:text-slate-900 border border-slate-200/50'
+                        }`}
+                      >
+                        <span className="text-[12px] drop-shadow-sm">{modeEmoji}</span>
+                        {meta.label}
+                      </button>
+                    );
+                  })}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setModeSelectionSource('auto');
+                      toast.info('自动识别：将根据输入自动选择模式');
+                    }}
+                    className={`relative flex items-center gap-1 rounded-full px-2.5 py-1 text-[11px] font-bold transition-all duration-300 shadow-sm ${
+                      modeSelectionSource === 'auto'
+                        ? 'bg-blue-50 text-blue-700 border border-blue-400/40 shadow-blue-200/30'
+                        : 'bg-slate-100 text-slate-600 hover:bg-slate-200 hover:text-slate-900 border border-slate-200/50'
+                    }`}
+                  >
+                    自动识别
+                  </button>
+                </div>
+              </div>
+              
+              <div className="flex items-center gap-2">
                 <button
-                  onClick={stopGenerating}
-                  className="group flex h-10 w-10 items-center justify-center rounded-full bg-slate-100 text-slate-500 shadow-sm transition-all hover:bg-slate-200 hover:text-slate-700"
-                  title="停止生成"
+                  onClick={() => setDeepThinking(!deepThinking)}
+                  className={`flex items-center gap-1 rounded-full px-2.5 py-1 text-[11px] font-medium transition-colors ${
+                    deepThinking
+                      ? 'text-blue-600 bg-blue-50 border border-blue-100'
+                      : 'text-gray-500 hover:text-gray-700 hover:bg-gray-50 border border-transparent'
+                  }`}
                 >
-                  <div className="h-3.5 w-3.5 rounded-[3px] bg-current transition-transform group-hover:scale-90" />
+                  <BrainCircuit className="h-3.5 w-3.5" />
+                  深度思考
                 </button>
-              ) : (
-                <button
-                  onClick={() => handleSend()}
-                  disabled={(!input.trim() && !imagePreview)}
-                  className="group flex h-10 w-10 items-center justify-center rounded-full bg-slate-900 text-white shadow-sm transition-all hover:bg-slate-800 disabled:bg-slate-100 disabled:text-slate-400 disabled:shadow-none"
-                >
-                  <Send className="h-[18px] w-[18px] transition-transform group-hover:-translate-y-0.5 group-hover:translate-x-0.5 group-disabled:transform-none" />
-                </button>
-              )}
+                {sending ? (
+                  <button
+                    onClick={stopGenerating}
+                    className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-red-100 text-red-600 transition-all hover:bg-red-200 hover:text-red-700 shadow-sm group"
+                    title="停止生成"
+                  >
+                    <Square className="h-4 w-4 fill-current" />
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => handleSend()}
+                    disabled={(!input.trim() && !imagePreview)}
+                    className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gray-900 text-white transition-all hover:bg-gray-800 disabled:bg-gray-100 disabled:text-gray-400 disabled:shadow-none shadow-sm active:scale-95"
+                  >
+                    <Send className="h-4 w-4" />
+                  </button>
+                )}
+              </div>
             </div>
           </div>
-          <p className="mt-4 text-center text-[11px] font-medium tracking-wide text-slate-400">
+          <p className="mt-2 text-center text-[10px] text-gray-400">
             AI 可能会犯错，请结合实际情况参考解析。
           </p>
         </div>

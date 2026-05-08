@@ -18,6 +18,8 @@ import {
   type TagExtensions,
 } from './types';
 import { getKnowledgePointsBySubjectFromTaxonomy, isKnowledgePointInSubjectTaxonomy } from './knowledgeTaxonomy';
+import { sanitizeKnowledgeMarkdownForStorage } from './knowledgeContent';
+import { isCoreIngestAction } from './aiActionContract';
 
 export type CopilotRisk = CopilotRiskLevel;
 
@@ -32,6 +34,9 @@ export type CopilotActionProposal = {
 export type KnowledgeUpdateDraft = {
   tag: string;
   markdown: string;
+  tagId?: string;
+  nodeId?: string;
+  subject?: Subject;
   note?: string;
   title?: string;
   reason?: string;
@@ -47,6 +52,11 @@ export const READ_COPILOT_ACTIONS: CopilotReadActionType[] = [
 
 export const INTERPRET_COPILOT_ACTIONS: CopilotInterpretActionType[] = [
   'explain_mistake',
+];
+
+// render_inline_quiz 属于“展示”性质的渲染动作，但也具有副作用，放到支持的白名单中
+export const RENDER_COPILOT_ACTIONS: CopilotActionType[] = [
+  'render_inline_quiz',
 ];
 
 export const WRITE_COPILOT_ACTIONS: CopilotWriteActionType[] = [
@@ -66,6 +76,7 @@ const SUPPORTED_COPILOT_ACTIONS: CopilotActionType[] = [
   ...READ_COPILOT_ACTIONS,
   ...INTERPRET_COPILOT_ACTIONS,
   ...WRITE_COPILOT_ACTIONS,
+  ...RENDER_COPILOT_ACTIONS,
   'start_review',
   'start_drill',
 ];
@@ -98,18 +109,51 @@ export function extractKnowledgeUpdatesFromAction(action: CopilotActionProposal 
         : (payload.markdown ? [payload] : [])));
   const results = rawItems
     .filter((item: unknown) => Boolean(item) && typeof item === 'object')
-    .map((item: any) => ({
-      tag: String(item.tag || item.node || item.knowledge_point || '').trim(),
-      markdown: String(item.markdown || ''),
-      note: item.note ? String(item.note) : undefined,
-      title: item.title ? String(item.title) : undefined,
-      reason: item.reason ? String(item.reason) : undefined,
-      decision: item.decision === 'skip' || item.decision === 'rewrite' || item.decision === 'create'
-        ? item.decision
-        : undefined,
-    }))
+    .map((item: any) => {
+      const tag = String(item.tag || item.node || item.knowledge_point || '').trim();
+      const markdown = sanitizeKnowledgeMarkdownForStorage(String(item.markdown || ''), tag);
+      return {
+        tag,
+        markdown,
+        tagId: String(item.tag_id || item.tagId || '').trim() || undefined,
+        nodeId: String(item.node_id || item.nodeId || item.knowledge_point_id || item.knowledgePointId || '').trim() || undefined,
+        subject: item.subject === 'C语言' || item.subject === '英语'
+          ? item.subject
+          : undefined,
+        note: item.note ? String(item.note) : undefined,
+        title: item.title ? String(item.title) : undefined,
+        reason: item.reason ? String(item.reason) : undefined,
+        decision: item.decision === 'skip' || item.decision === 'rewrite' || item.decision === 'create'
+          ? item.decision
+          : undefined,
+      };
+    })
     .filter(item => item.tag && item.markdown);
   return results.length > 0 ? results : undefined;
+}
+
+export function getCopilotActionDisplayName(actionType: CopilotActionType) {
+  const map: Record<CopilotActionType, string> = {
+    get_node_dossier: '读取节点档案',
+    list_node_mistakes: '查询错题列表',
+    rank_node_mistakes: '错题排序',
+    compare_mistakes: '错题对比',
+    explain_mistake: '讲解错题',
+    create_mistake: '新增错题',
+    update_mistake: '更新错题',
+    move_mistake_to_node: '移动错题',
+    delete_mistake: '删除错题',
+    batch_update_mistakes: '批量更新错题',
+    create_node_note_section: '新增节点章节',
+    rewrite_node_notebook: '重写节点笔记',
+    reorder_node_notebook: '重排节点章节',
+    update_tags: '更新标签',
+    update_learning_content: '更新知识点总结',
+    render_inline_quiz: '生成随堂测验',
+    start_review: '发起复习',
+    start_drill: '发起练习',
+  };
+  return map[actionType] || '执行动作';
 }
 
 export function isOutOfScopeLearningRequest(input: string) {
@@ -240,6 +284,55 @@ export function repairJson(json: string): string {
   return result;
 }
 
+function parseKnowledgePlanFromText(raw: string): CopilotActionProposal | null {
+  const text = String(raw || '');
+  if (!text) return null;
+  if (!/(本次更新计划|更新计划|标签\s+操作\s+说明|rewrite|merge|create|增量整合)/i.test(text)) {
+    return null;
+  }
+  const rows = text
+    .split('\n')
+    .map((line) => line.replace(/\u00a0/g, ' ').trim())
+    .filter(Boolean);
+  const updates: KnowledgeUpdateDraft[] = [];
+  for (const row of rows) {
+    if (/^标签\s+操作\s+说明$/i.test(row)) continue;
+    if (/^[-|｜\s]+$/.test(row)) continue;
+    if (/^(📌|✅|⚠️|⚠|好的|根据|所有知识点|高风险操作)/.test(row)) continue;
+    const matched = row.match(/^(.+?)\s+(rewrite|create|merge|skip|改写|新增|合并|跳过)\s+(.+)$/i);
+    if (!matched) continue;
+    const tag = String(matched[1] || '').trim();
+    const operation = String(matched[2] || '').trim().toLowerCase();
+    const summary = String(matched[3] || '').trim();
+    if (!tag || !summary) continue;
+    const decision: KnowledgeUpdateDraft['decision'] =
+      operation === 'create' || operation === '新增'
+        ? 'create'
+        : operation === 'skip' || operation === '跳过'
+          ? 'skip'
+          : 'rewrite';
+    const markdown = [
+      `### ${tag}`,
+      `- ${summary}`,
+    ].join('\n');
+    updates.push({
+      tag,
+      markdown,
+      reason: summary,
+      decision,
+    });
+  }
+  if (updates.length === 0) return null;
+  const risk: CopilotRisk = /高风险/.test(text) ? 'high' : 'medium';
+  return {
+    type: 'update_learning_content',
+    risk,
+    title: '知识点增量归并计划',
+    description: '从自然语言更新计划自动提取可执行知识点更新动作',
+    payload: { updates },
+  };
+}
+
 export function parseCopilotAction(raw: string): CopilotActionProposal | null {
   const match = raw.match(/<ACTION>([\s\S]*?)<\/ACTION>/i);
   let jsonString = '';
@@ -255,7 +348,7 @@ export function parseCopilotAction(raw: string): CopilotActionProposal | null {
       if (bareMatch && new RegExp(`"(?:${supportedPattern})"`).test(bareMatch[0])) {
         jsonString = bareMatch[1].trim();
       } else {
-        return null;
+        return parseKnowledgePlanFromText(raw);
       }
     }
   }
@@ -263,11 +356,51 @@ export function parseCopilotAction(raw: string): CopilotActionProposal | null {
   try {
     jsonString = jsonString.replace(/^```[a-z]*\n?/, '').replace(/```$/, '').trim();
     jsonString = repairJson(jsonString);
-    const parsed = JSON.parse(jsonString) as CopilotActionProposal;
-    if (!parsed || typeof parsed !== 'object' || !parsed.type || !parsed.payload) return null;
-    if (!SUPPORTED_COPILOT_ACTIONS.includes(parsed.type)) return null;
-    const risk = inferCopilotRisk(parsed.type, parsed.risk);
-    return { ...parsed, risk };
+    const parsed = JSON.parse(jsonString) as Record<string, any>;
+    if (!parsed || typeof parsed !== 'object') return null;
+    const actionType = String(parsed.type || parsed.action_type || parsed.actionType || '').trim() as CopilotActionType;
+    if (!actionType || !SUPPORTED_COPILOT_ACTIONS.includes(actionType)) return null;
+    const normalizedPayloadBase = parsed.payload && typeof parsed.payload === 'object'
+      ? parsed.payload
+      : {};
+    const payload = actionType === 'update_learning_content'
+      ? (() => {
+        const updates = Array.isArray(normalizedPayloadBase.updates)
+          ? normalizedPayloadBase.updates
+          : Array.isArray(parsed.updates)
+            ? parsed.updates
+            : Array.isArray(parsed.learning_updates)
+              ? parsed.learning_updates
+              : Array.isArray(normalizedPayloadBase.learning_updates)
+                ? normalizedPayloadBase.learning_updates
+                : normalizedPayloadBase.learning_update
+                  ? [normalizedPayloadBase.learning_update]
+                  : parsed.learning_update
+                    ? [parsed.learning_update]
+                    : [];
+        if (updates.length > 0) return { ...normalizedPayloadBase, updates };
+        if (normalizedPayloadBase.markdown || parsed.markdown) {
+          return {
+            ...normalizedPayloadBase,
+            updates: [{
+              tag: normalizedPayloadBase.tag || parsed.tag || normalizedPayloadBase.node || parsed.node || normalizedPayloadBase.knowledge_point || parsed.knowledge_point || '',
+              markdown: normalizedPayloadBase.markdown || parsed.markdown || '',
+              decision: normalizedPayloadBase.decision || parsed.decision,
+              reason: normalizedPayloadBase.reason || parsed.reason,
+            }],
+          };
+        }
+        return normalizedPayloadBase;
+      })()
+      : normalizedPayloadBase;
+    const risk = inferCopilotRisk(actionType, parsed.risk);
+    return {
+      type: actionType,
+      title: parsed.title,
+      description: parsed.description,
+      risk,
+      payload,
+    };
   } catch {
     return null;
   }
@@ -338,6 +471,7 @@ export function inferCopilotRisk(actionType: CopilotActionType, explicitRisk?: C
   if (explicitRisk === 'high' || explicitRisk === 'medium' || explicitRisk === 'low') {
     return explicitRisk;
   }
+  if (isCoreIngestAction(actionType)) return 'medium';
   if (HIGH_RISK_ACTIONS.has(actionType)) return 'high';
   if (MEDIUM_RISK_ACTIONS.has(actionType)) return 'medium';
   return 'low';
@@ -442,10 +576,18 @@ export function validateCopilotActionRequest(
 
   if (!context.allowCrossNodeTarget) {
     if (context.currentNodeId && request.target_ids.node_id && request.target_ids.node_id !== context.currentNodeId) {
-      warnings.push('动作目标 node_id 与当前节点不同，将以当前节点作用域为准');
+      if (isCopilotWriteAction(request.action_type)) {
+        errors.push('写入动作目标 node_id 与当前节点不一致，已拒绝执行');
+      } else {
+        warnings.push('动作目标 node_id 与当前节点不同，将以当前节点作用域为准');
+      }
     }
     if (context.currentTagId && request.target_ids.tag_id && request.target_ids.tag_id !== context.currentTagId) {
-      warnings.push('动作目标 tag_id 与当前标签不同，将以当前标签作用域为准');
+      if (isCopilotWriteAction(request.action_type)) {
+        errors.push('写入动作目标 tag_id 与当前标签不一致，已拒绝执行');
+      } else {
+        warnings.push('动作目标 tag_id 与当前标签不同，将以当前标签作用域为准');
+      }
     }
   }
 
@@ -598,16 +740,17 @@ export function createCopilotPreview(preview: CopilotExecutionPreview): CopilotE
 }
 
 export function summarizeCopilotReceipt(receipt: CopilotExecutionReceipt) {
+  const actionLabel = getCopilotActionDisplayName(receipt.action_type);
   if (receipt.executed_stage === 'preview' && receipt.preview) {
-    return `${receipt.action_type} 预览已生成：${receipt.preview.summary}`;
+    return `${actionLabel}预览已生成：${receipt.preview.summary}`;
   }
   if (!receipt.success) {
     return `执行失败：${receipt.failure_reason || '未知原因'}`;
   }
-  const applied = receipt.applied_fields.length > 0 ? `已应用 ${receipt.applied_fields.join('、')}` : '本次无字段落库';
+  const applied = receipt.applied_fields.length > 0 ? '已完成数据更新' : '本次无实际变更';
   const warnings = receipt.validation_warnings.length > 0 ? `；警告：${receipt.validation_warnings.join('；')}` : '';
   const snapshot = receipt.latest_snapshot_version ? `；快照 ${receipt.latest_snapshot_version}` : '';
-  return `${receipt.action_type} 已完成，${applied}${warnings}${snapshot}`;
+  return `${actionLabel}已完成，${applied}${warnings}${snapshot}`;
 }
 
 function getTagExtensions(): Partial<Record<'knowledge_point' | 'ability' | 'error_type', string[]>> {

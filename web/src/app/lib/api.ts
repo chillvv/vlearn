@@ -1,5 +1,3 @@
-import { createClient } from '@supabase/supabase-js';
-import { projectId, publicAnonKey } from '../../../utils/supabase/info';
 import type {
   GovernedGenerationRequest,
   GovernedGenerationResult,
@@ -69,72 +67,337 @@ import {
   resolveReviewPlannerRollout,
 } from './reviewPlannerStrategy';
 
-function getSupabaseConfig() {
-  const env = (import.meta as any).env || {};
-  const envUrl = String(env.VITE_SUPABASE_URL || env.NEXT_PUBLIC_SUPABASE_URL || '').trim();
-  const envAnonKey = String(env.VITE_SUPABASE_ANON_KEY || env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '').trim();
-  if (envUrl && envAnonKey) {
-    return {
-      url: envUrl,
-      anonKey: envAnonKey,
-    };
-  }
+const LOCAL_DEV_USER_ID = '359ed1b4-913b-41a2-8d9f-f597d0f2084c';
+const LOCAL_DEV_USER_EMAIL = '1300968688@qq.com';
+const LOCAL_AUTH_SESSION_KEY = 'vlearn_local_auth_session';
+const LOCAL_TOKEN_PREFIX = 'local-user:';
+const LEGACY_LOCAL_FALLBACK_ACCESS_TOKEN = 'eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJsb2NhbC1kZXYtdXNlciIsImVtYWlsIjoibG9jYWxAZXhhbXBsZS5jb20iLCJleHAiOjQxMDI0NDQ4MDB9.local';
+
+type LocalAuthUser = {
+  id: string;
+  email: string;
+  aud: 'authenticated';
+  app_metadata: Record<string, unknown>;
+  user_metadata: Record<string, unknown>;
+  created_at: string;
+};
+
+type LocalAuthSession = {
+  access_token: string;
+  token_type: 'bearer';
+  expires_in: number;
+  expires_at: number;
+  refresh_token: string;
+  user: LocalAuthUser;
+};
+
+type LocalAuthStateListener = (_event: string, session: LocalAuthSession) => void;
+
+function buildLocalAuthUser(name?: string | null): LocalAuthUser {
   return {
-    url: `https://${projectId}.supabase.co`,
-    anonKey: publicAnonKey,
+    id: LOCAL_DEV_USER_ID,
+    email: LOCAL_DEV_USER_EMAIL,
+    aud: 'authenticated',
+    app_metadata: {},
+    user_metadata: name ? { name: String(name).trim() } : {},
+    created_at: new Date(0).toISOString(),
   };
 }
 
-const createSupabaseClient = () => {
-  const config = getSupabaseConfig();
-  return createClient(config.url, config.anonKey);
-};
-type SupabaseClientType = ReturnType<typeof createSupabaseClient>;
-
-const globalScope = globalThis as typeof globalThis & {
-  __vlearnSupabaseClient__?: SupabaseClientType;
-};
-
-const LOCAL_DEV_USER_ID = 'local-dev-user';
-const LOCAL_DEV_USER_EMAIL = 'local@example.com';
-const LOCAL_DEV_FALLBACK_ACCESS_TOKEN = 'eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJsb2NhbC1kZXYtdXNlciIsImVtYWlsIjoibG9jYWxAZXhhbXBsZS5jb20iLCJleHAiOjQxMDI0NDQ4MDB9.local';
-
-export const supabase: SupabaseClientType = globalScope.__vlearnSupabaseClient__ || createSupabaseClient();
-
-if (!globalScope.__vlearnSupabaseClient__) {
-  globalScope.__vlearnSupabaseClient__ = supabase;
+function buildLocalAuthSession(user: LocalAuthUser = buildLocalAuthUser()): LocalAuthSession {
+  const expiresIn = 60 * 60 * 24 * 365;
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  return {
+    access_token: LEGACY_LOCAL_FALLBACK_ACCESS_TOKEN,
+    token_type: 'bearer',
+    expires_in: expiresIn,
+    expires_at: nowSeconds + expiresIn,
+    refresh_token: '',
+    user,
+  };
 }
 
-if (isLocalDataApiMode()) {
-  const rawGetSession = supabase.auth.getSession.bind(supabase.auth);
-  const rawGetUser = supabase.auth.getUser.bind(supabase.auth);
-  supabase.auth.getUser = (async (jwt?: string) => {
-    if (jwt) {
-      return rawGetUser(jwt);
-    }
-    const sessionResult = await rawGetSession();
-    const sessionUser = sessionResult.data.session?.user;
-    return {
-      data: {
-        user: sessionUser || ({
-          id: LOCAL_DEV_USER_ID,
-          email: LOCAL_DEV_USER_EMAIL,
-          aud: 'authenticated',
-          app_metadata: {},
-          user_metadata: {},
-          created_at: new Date(0).toISOString(),
-        } as any),
-      },
-      error: null,
-    } as Awaited<ReturnType<typeof rawGetUser>>;
-  }) as typeof supabase.auth.getUser;
+const localAuthListeners = new Set<LocalAuthStateListener>();
+const singletonLocalSession = buildLocalAuthSession();
+
+function readLocalAuthSession(): LocalAuthSession {
+  if (typeof window === 'undefined') return singletonLocalSession;
+  const raw = window.localStorage.getItem(LOCAL_AUTH_SESSION_KEY);
+  if (!raw) return singletonLocalSession;
+  try {
+    const parsed = JSON.parse(raw) as LocalAuthSession;
+    if (!parsed?.user?.id || !parsed?.access_token) return singletonLocalSession;
+    const needsNormalizeToken = parsed.access_token !== LEGACY_LOCAL_FALLBACK_ACCESS_TOKEN;
+    const needsNormalizeUser = parsed.user.id !== LOCAL_DEV_USER_ID;
+    if (!needsNormalizeToken && !needsNormalizeUser) return parsed;
+    const normalizedSession = buildLocalAuthSession(buildLocalAuthUser(parsed.user?.user_metadata?.name as string | undefined));
+    writeLocalAuthSession(normalizedSession);
+    return normalizedSession;
+  } catch {
+    return singletonLocalSession;
+  }
 }
+
+function writeLocalAuthSession(session: LocalAuthSession) {
+  if (typeof window === 'undefined') return;
+  window.localStorage.setItem(LOCAL_AUTH_SESSION_KEY, JSON.stringify(session));
+}
+
+function emitLocalAuthState(event: string, session: LocalAuthSession) {
+  localAuthListeners.forEach((listener) => {
+    listener(event, session);
+  });
+}
+
+function parseUserIdFromToken(token: string) {
+  const raw = String(token || '').trim();
+  if (raw === LEGACY_LOCAL_FALLBACK_ACCESS_TOKEN) return LOCAL_DEV_USER_ID;
+  if (!raw.startsWith(LOCAL_TOKEN_PREFIX)) return '';
+  return decodeURIComponent(raw.slice(LOCAL_TOKEN_PREFIX.length));
+}
+
+type SupabaseClientType = {
+  auth: {
+    getSession: () => Promise<{ data: { session: LocalAuthSession | null }; error: null }>;
+    getUser: (jwt?: string) => Promise<{ data: { user: LocalAuthUser | null }; error: null }>;
+    signUp: (input: { email: string; password: string; options?: { data?: Record<string, unknown> } }) => Promise<{ data: { user: LocalAuthUser; session: LocalAuthSession }; error: null }>;
+    signInWithPassword: (input: { email: string; password: string }) => Promise<{ data: { user: LocalAuthUser; session: LocalAuthSession }; error: null }>;
+    signOut: () => Promise<{ error: null }>;
+    updateUser: (input: Record<string, unknown>) => Promise<{ data: { user: LocalAuthUser | null }; error: null }>;
+    onAuthStateChange: (listener: LocalAuthStateListener) => { data: { subscription: { unsubscribe: () => void } } };
+  };
+  from: (table: string) => any;
+  rpc: (fn: string, params?: Record<string, unknown>) => Promise<any>;
+};
+
+function unsupportedSupabaseCall(name: string): never {
+  throw new Error(`当前仅支持 local_api 模式，禁止 Supabase 调用: ${name}`);
+}
+
+export const supabase: SupabaseClientType = {
+  auth: {
+    getSession: async () => ({ data: { session: readLocalAuthSession() }, error: null }),
+    getUser: async (jwt?: string) => {
+      if (jwt) {
+        const userId = parseUserIdFromToken(jwt);
+        if (userId) {
+          return { data: { user: buildLocalAuthUser() }, error: null };
+        }
+      }
+      const session = readLocalAuthSession();
+      return { data: { user: session.user }, error: null };
+    },
+    signUp: async ({ options }) => {
+      const user = buildLocalAuthUser(String(options?.data?.name || '').trim() || null);
+      const session = buildLocalAuthSession(user);
+      writeLocalAuthSession(session);
+      emitLocalAuthState('SIGNED_IN', session);
+      return { data: { user, session }, error: null };
+    },
+    signInWithPassword: async () => {
+      const user = buildLocalAuthUser();
+      const session = buildLocalAuthSession(user);
+      writeLocalAuthSession(session);
+      emitLocalAuthState('SIGNED_IN', session);
+      return { data: { user, session }, error: null };
+    },
+    signOut: async () => {
+      const session = readLocalAuthSession();
+      emitLocalAuthState('SIGNED_IN', session);
+      return { error: null };
+    },
+    updateUser: async () => {
+      const session = readLocalAuthSession();
+      return { data: { user: session.user }, error: null };
+    },
+    onAuthStateChange: (listener: LocalAuthStateListener) => {
+      localAuthListeners.add(listener);
+      return {
+        data: {
+          subscription: {
+            unsubscribe: () => {
+              localAuthListeners.delete(listener);
+            },
+          },
+        },
+      };
+    },
+  },
+  from: () => unsupportedSupabaseCall('from'),
+  rpc: async () => unsupportedSupabaseCall('rpc'),
+};
+
+const LOCAL_DEV_FALLBACK_ACCESS_TOKEN = LEGACY_LOCAL_FALLBACK_ACCESS_TOKEN;
 
 const DEFAULT_AI_PROXY_URL = `https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions`;
 
 function getAiProxyUrl() {
   const env = (import.meta as any).env || {};
   return env.VITE_AI_PROXY_URL || env.NEXT_PUBLIC_AI_PROXY_URL || DEFAULT_AI_PROXY_URL;
+}
+
+const AI_MAX_CONCURRENT_REQUESTS = 3;
+const AI_CHAT_DUPLICATE_WINDOW_MS = 1500;
+const AI_GUARD_FAILURE_THRESHOLD = 3;
+const AI_GUARD_COOLDOWN_MS = 60_000;
+const AI_GUARD_INFLIGHT_STALE_MS = 180_000;
+const AI_STREAM_TIMEOUT_MS = 120_000;
+const AI_STREAM_MAX_CONTENT_CHARS = 18_000;
+const AI_STREAM_MAX_REASONING_CHARS = 24_000;
+
+type AiGuardState = {
+  lastStartAt: number;
+  consecutiveFailures: number;
+  cooldownUntil: number;
+};
+
+type AiInFlightState = {
+  startedAt: number;
+};
+
+const aiGuardStateByKey = new Map<string, AiGuardState>();
+const aiInFlightByKey = new Map<string, AiInFlightState>();
+let aiGlobalInFlightCount = 0;
+
+function trimGuardText(value: unknown, maxLength = 200) {
+  const raw = String(value ?? '').trim().replace(/\s+/g, ' ');
+  if (raw.length <= maxLength) return raw;
+  return raw.slice(0, maxLength);
+}
+
+function stringifyGuardContent(content: any) {
+  if (typeof content === 'string') return trimGuardText(content, 260);
+  if (Array.isArray(content)) {
+    return trimGuardText(content.map((item) => {
+      if (typeof item === 'string') return item;
+      if (item && typeof item === 'object' && typeof item.type === 'string') {
+        if (item.type === 'text') return String(item.text || '');
+        if (item.type === 'image_url') return '[image]';
+      }
+      return JSON.stringify(item);
+    }).join(' | '), 260);
+  }
+  return trimGuardText(JSON.stringify(content), 260);
+}
+
+function pruneAiGuardState(now = Date.now()) {
+  const staleKeys: string[] = [];
+  aiInFlightByKey.forEach((entry, key) => {
+    if (now - entry.startedAt > AI_GUARD_INFLIGHT_STALE_MS) {
+      staleKeys.push(key);
+    }
+  });
+  if (staleKeys.length > 0) {
+    staleKeys.forEach((key) => {
+      if (aiInFlightByKey.delete(key)) {
+        aiGlobalInFlightCount = Math.max(0, aiGlobalInFlightCount - 1);
+      }
+    });
+  }
+}
+
+function acquireAiRequestGuard(input: {
+  key: string;
+  duplicateWindowMs?: number;
+}) {
+  const now = Date.now();
+  pruneAiGuardState(now);
+  const state = aiGuardStateByKey.get(input.key) || {
+    lastStartAt: 0,
+    consecutiveFailures: 0,
+    cooldownUntil: 0,
+  };
+  if (state.cooldownUntil > now) {
+    const seconds = Math.max(1, Math.ceil((state.cooldownUntil - now) / 1000));
+    throw new Error(`ai_guard_cooldown_${seconds}`);
+  }
+  if (aiInFlightByKey.has(input.key)) {
+    throw new Error('ai_guard_inflight_duplicate');
+  }
+  if (aiGlobalInFlightCount >= AI_MAX_CONCURRENT_REQUESTS) {
+    throw new Error('ai_guard_global_busy');
+  }
+  if ((input.duplicateWindowMs || 0) > 0 && now - state.lastStartAt < (input.duplicateWindowMs || 0)) {
+    throw new Error('ai_guard_too_frequent');
+  }
+  state.lastStartAt = now;
+  aiGuardStateByKey.set(input.key, state);
+  aiInFlightByKey.set(input.key, { startedAt: now });
+  aiGlobalInFlightCount += 1;
+  let released = false;
+  return {
+    release: (outcome: 'success' | 'failed') => {
+      if (released) return;
+      released = true;
+      if (aiInFlightByKey.delete(input.key)) {
+        aiGlobalInFlightCount = Math.max(0, aiGlobalInFlightCount - 1);
+      }
+      const current = aiGuardStateByKey.get(input.key) || state;
+      if (outcome === 'success') {
+        current.consecutiveFailures = 0;
+      } else {
+        current.consecutiveFailures += 1;
+        if (current.consecutiveFailures >= AI_GUARD_FAILURE_THRESHOLD) {
+          current.cooldownUntil = Date.now() + AI_GUARD_COOLDOWN_MS;
+          current.consecutiveFailures = 0;
+        }
+      }
+      aiGuardStateByKey.set(input.key, current);
+    },
+  };
+}
+
+function mapAiGuardErrorMessage(err: unknown) {
+  const message = String((err as any)?.message || '');
+  if (message.startsWith('ai_guard_cooldown_')) {
+    const seconds = Number(message.replace('ai_guard_cooldown_', '')) || 60;
+    return `AI 调用已进入冷却保护，请 ${seconds} 秒后重试`;
+  }
+  if (message === 'ai_guard_inflight_duplicate') {
+    return '检测到同一请求仍在处理中，已自动拦截重复调用';
+  }
+  if (message === 'ai_guard_global_busy') {
+    return '当前并发请求过多，已触发保护，请稍后重试';
+  }
+  if (message === 'ai_guard_too_frequent') {
+    return '触发过于频繁，已触发防抖保护，请稍后再试';
+  }
+  if (message === 'ai_guard_content_too_long') {
+    return 'AI 输出过长，已自动中止以防止异常消耗';
+  }
+  if (message === 'ai_guard_reasoning_too_long') {
+    return 'AI 深度思考输出过长，已自动中止以防止异常消耗';
+  }
+  return message;
+}
+
+function buildChatGuardKey(input: {
+  model?: string;
+  systemPrompt?: string;
+  enableThinking?: boolean;
+  messages: { role: string; content: any }[];
+}) {
+  const normalizedMessages = Array.isArray(input.messages) ? input.messages : [];
+  const lastUserMessage = [...normalizedMessages].reverse().find((item) => item?.role === 'user');
+  const roleSummary = normalizedMessages.slice(-4).map((item) => item?.role || 'unknown').join(',');
+  return [
+    trimGuardText(input.model || '', 80),
+    input.enableThinking ? 'thinking' : 'normal',
+    trimGuardText(input.systemPrompt || '', 120),
+    roleSummary,
+    stringifyGuardContent(lastUserMessage?.content || ''),
+  ].join('|');
+}
+
+function buildPlannerGuardKey(payload: PlannerInputPayload, strategyTemplate: string) {
+  const queueIds = (payload.questions || []).slice(0, 24).map((item) => String(item.question_id || '').trim()).join(',');
+  return [
+    'planner',
+    strategyTemplate,
+    (payload.session_constraints.subjects || []).join(','),
+    String(payload.session_constraints.budget_count || 0),
+    queueIds,
+  ].join('|');
 }
 
 function isLocalDataApiMode() {
@@ -851,6 +1114,9 @@ async function requestLivePlannerOutput(input: {
   if (!apiKey) {
     return generateHeuristicPlannerOutput(input.payload, planVersion, input.strategyMeta);
   }
+  const plannerGuard = acquireAiRequestGuard({
+    key: buildPlannerGuardKey(input.payload, input.strategyMeta.strategy_template),
+  });
   const response = await fetch(getAiProxyUrl(), {
     method: 'POST',
     headers: {
@@ -868,16 +1134,26 @@ async function requestLivePlannerOutput(input: {
       ],
     }),
     signal: input.signal,
+  }).catch((err) => {
+    plannerGuard.release('failed');
+    throw err;
   });
-  if (!response.ok) {
-    throw new Error(`planner_http_${response.status}`);
+  try {
+    if (!response.ok) {
+      throw new Error(`planner_http_${response.status}`);
+    }
+    const body = await response.json();
+    const content = String(body?.choices?.[0]?.message?.content || '').trim();
+    if (!content) {
+      throw new Error('planner_empty_content');
+    }
+    const normalized = normalizePlannerOutput(extractPlannerJson(content), input.payload, planVersion);
+    plannerGuard.release('success');
+    return normalized;
+  } catch (err) {
+    plannerGuard.release('failed');
+    throw err;
   }
-  const body = await response.json();
-  const content = String(body?.choices?.[0]?.message?.content || '').trim();
-  if (!content) {
-    throw new Error('planner_empty_content');
-  }
-  return normalizePlannerOutput(extractPlannerJson(content), input.payload, planVersion);
 }
 
 // Levenshtein distance for fuzzy matching
@@ -2182,6 +2458,10 @@ function compareQuestionsByStrategy(left: Question, right: Question, strategy: N
   return rightErrorAt - leftErrorAt;
 }
 
+function normalizeScopeKey(value: unknown) {
+  return String(value || '').trim().replace(/\s+/g, '').toLowerCase();
+}
+
 function deriveNodeNotebook(
   learningState: UserLearningStateRecord,
   params: {
@@ -2190,16 +2470,29 @@ function deriveNodeNotebook(
     tagName: string;
     nodeName: string;
   },
+  fallbackMarkdown?: string,
 ) {
   const drawerByTag = learningState.learning_content?.drawerByTag || {};
-  const sourceKey = [
+  const scopeKeys = [
     params.nodeId,
     params.nodeName,
     params.tagId,
     params.tagName,
-  ].map((item) => String(item || '').trim()).find((item) => item && drawerByTag[item]) || '';
+  ].map((item) => String(item || '').trim()).filter(Boolean);
+  const normalizedScopeKeys = scopeKeys.map((item) => normalizeScopeKey(item)).filter(Boolean);
+  let sourceKey = scopeKeys.find((item) => drawerByTag[item]) || '';
+  if (!sourceKey && normalizedScopeKeys.length > 0) {
+    for (const [key, value] of Object.entries(drawerByTag)) {
+      const normalizedKey = normalizeScopeKey(key);
+      const normalizedTitle = normalizeScopeKey((value as any)?.title);
+      if (normalizedScopeKeys.includes(normalizedKey) || (normalizedTitle && normalizedScopeKeys.includes(normalizedTitle))) {
+        sourceKey = key;
+        break;
+      }
+    }
+  }
   const drawer = sourceKey ? drawerByTag[sourceKey] : undefined;
-  const contentMarkdown = String(drawer?.markdown || '').trim();
+  const contentMarkdown = String(drawer?.markdown || fallbackMarkdown || '').trim();
   const summary = clipText(drawer?.summary || contentMarkdown, 160);
   return {
     node_id: params.nodeId,
@@ -2207,7 +2500,7 @@ function deriveNodeNotebook(
     title: String(drawer?.title || params.nodeName || params.tagName || '知识点笔记').trim(),
     summary,
     content_markdown: contentMarkdown,
-    source_key: sourceKey || params.nodeId || params.nodeName || params.tagId || params.tagName,
+    source_key: sourceKey || scopeKeys[0] || params.nodeId || params.nodeName || params.tagId || params.tagName,
     sections: parseNotebookSections(contentMarkdown, params.nodeId),
   };
 }
@@ -2218,6 +2511,8 @@ function buildSnapshotVersion(parts: Array<unknown>) {
 
 async function resolveNodeScope(query: NodeDossierQuery | NodeMistakeLookupQuery) {
   const questions = await questionsApi.getAll({ includeArchived: true });
+  const requestedTagId = String(query.tagId || '').trim();
+  const requestedNodeId = String(query.nodeId || '').trim();
   const activeIds = uniqueStrings([
     query.activeMistakeId,
     query.activeMistakeIds || [],
@@ -2226,22 +2521,49 @@ async function resolveNodeScope(query: NodeDossierQuery | NodeMistakeLookupQuery
   const activePool = activeIds.length > 0
     ? questions.filter((question) => activeIds.includes(resolveCanonicalMistakeId(question)))
     : [];
-  const candidatePool = questions.filter((question) => {
+  const strictPool = questions.filter((question) => {
     const tagId = resolveCanonicalTagId(question);
     const nodeId = resolveCanonicalNodeId(question);
     if (query.tagId && tagId !== query.tagId) return false;
     if (query.nodeId && nodeId !== query.nodeId) return false;
     return true;
   });
+  const tagOnlyPool = requestedTagId
+    ? questions.filter((question) => resolveCanonicalTagId(question) === requestedTagId)
+    : [];
+  const nodeOnlyPool = requestedNodeId
+    ? questions.filter((question) => resolveCanonicalNodeId(question) === requestedNodeId)
+    : [];
+  const candidatePool = requestedTagId
+    ? (strictPool.length > 0 ? strictPool : tagOnlyPool)
+    : strictPool.length > 0
+      ? strictPool
+      : nodeOnlyPool.length > 0
+        ? nodeOnlyPool
+        : tagOnlyPool;
   const workingPool = candidatePool.length > 0 ? candidatePool : activePool;
   const firstQuestion = activePool[0] || workingPool[0] || questions[0] || null;
-  const inferredTagId = String(query.tagId || resolveCanonicalTagId(firstQuestion) || '').trim();
-  const inferredNodeId = String(query.nodeId || resolveCanonicalNodeId(firstQuestion) || '').trim();
-  const scopedQuestions = questions.filter((question) => {
+  const inferredTagId = requestedTagId || String(resolveCanonicalTagId(firstQuestion) || '').trim();
+  const inferredNodeId = requestedNodeId || String(resolveCanonicalNodeId(firstQuestion) || '').trim();
+  let scopedQuestions = questions.filter((question) => {
     if (inferredTagId && resolveCanonicalTagId(question) !== inferredTagId) return false;
     if (inferredNodeId && resolveCanonicalNodeId(question) !== inferredNodeId) return false;
     return true;
   });
+  if (scopedQuestions.length === 0 && !requestedTagId) {
+    const fallbackTagName = String((firstQuestion as any)?.category || (firstQuestion as any)?.tag_name || '').trim();
+    const fallbackNodeName = String((firstQuestion as any)?.node || (firstQuestion as any)?.knowledge_point || (firstQuestion as any)?.name || '').trim();
+    const normalizedFallbackTag = normalizeScopeKey(fallbackTagName);
+    const normalizedFallbackNode = normalizeScopeKey(fallbackNodeName);
+    if (normalizedFallbackNode) {
+      scopedQuestions = questions.filter((question) => {
+        const questionTagName = String((question as any)?.category || (question as any)?.tag_name || '').trim();
+        const questionNodeName = String((question as any)?.node || (question as any)?.knowledge_point || (question as any)?.name || '').trim();
+        if (normalizedFallbackTag && normalizeScopeKey(questionTagName) !== normalizedFallbackTag) return false;
+        return normalizeScopeKey(questionNodeName) === normalizedFallbackNode;
+      });
+    }
+  }
   const scopeSeed = scopedQuestions[0] || firstQuestion || {};
   return {
     questions,
@@ -2251,6 +2573,29 @@ async function resolveNodeScope(query: NodeDossierQuery | NodeMistakeLookupQuery
     tagName: String((scopeSeed as any)?.category || (scopeSeed as any)?.tag_name || (scopeSeed as any)?.knowledge_point || '').trim(),
     nodeName: String((scopeSeed as any)?.node || (scopeSeed as any)?.knowledge_point || (scopeSeed as any)?.name || '').trim(),
   };
+}
+
+let knowledgeNodeTipsCache: { updatedAt: number; rows: Array<{ subject: string; category: string; branch?: string; node: string; tips_and_tricks: string }> } = {
+  updatedAt: 0,
+  rows: [],
+};
+
+async function getKnowledgeNodeTipsByScope(scope: { tagName: string; nodeName: string; questions: Question[] }) {
+  const now = Date.now();
+  if (now - knowledgeNodeTipsCache.updatedAt > 30_000 || knowledgeNodeTipsCache.rows.length === 0) {
+    const rows = await knowledgeNodesApi.getAll().catch(() => []);
+    knowledgeNodeTipsCache = { updatedAt: now, rows: Array.isArray(rows) ? rows : [] };
+  }
+  const subjectHint = String(scope.questions[0]?.subject || '').trim();
+  const tagHint = normalizeScopeKey(scope.tagName);
+  const nodeHint = normalizeScopeKey(scope.nodeName);
+  const matched = knowledgeNodeTipsCache.rows.find((row) => {
+    if (subjectHint && String(row.subject || '').trim() !== subjectHint) return false;
+    if (nodeHint && normalizeScopeKey(row.node) !== nodeHint) return false;
+    if (tagHint && normalizeScopeKey(row.category) !== tagHint) return false;
+    return true;
+  });
+  return String(matched?.tips_and_tricks || '').trim();
 }
 
 function buildNodeMistakeIndexEntry(
@@ -2330,12 +2675,13 @@ export const nodeDossierApi = {
     const limit = Math.max(1, Number(query.limit || DEFAULT_NODE_DOSSIER_LIMIT));
     const visibleRanking = ranking.slice(offset, offset + limit);
     const learningState = await userLearningStateApi.get();
+    const knowledgeNodeTips = await getKnowledgeNodeTipsByScope(scope);
     const notebook = deriveNodeNotebook(learningState, {
       tagId: scope.tagId,
       nodeId: scope.nodeId,
       tagName: scope.tagName,
       nodeName: scope.nodeName,
-    });
+    }, knowledgeNodeTips);
     const averageMastery = scope.scopedQuestions.length > 0
       ? Math.round(scope.scopedQuestions.reduce((sum, item) => sum + (item.mastery_level ?? Math.round((item.confidence ?? 0.5) * 100)), 0) / scope.scopedQuestions.length)
       : null;
@@ -3059,7 +3405,7 @@ export const questionsApi = {
     input: GovernedGenerationRequest,
     onBatch: (batch: VariantQuestion[], generated: number, total: number) => void,
   ): Promise<GovernedGenerationResult> => {
-    const total = Math.max(1, amount);
+    const total = Math.max(1, input.amount);
     const startedAt = Date.now();
     const normalizedInput = {
       ...input,
@@ -4182,14 +4528,30 @@ export async function buildCopilotLearningProfile(
       })
       .join('\n');
     const drawerByTag = userState?.learning_content?.drawerByTag || {};
+    const resolveDrawerByKnowledgePoint = (knowledgePoint: string) => {
+      const direct = (drawerByTag as any)?.[knowledgePoint];
+      if (direct) return { key: knowledgePoint, drawer: direct as any };
+      const normalizedPoint = normalizeScopeKey(knowledgePoint);
+      for (const [key, value] of Object.entries(drawerByTag as any)) {
+        const normalizedKey = normalizeScopeKey(key);
+        const normalizedTitle = normalizeScopeKey((value as any)?.title);
+        if (normalizedPoint && (normalizedPoint === normalizedKey || normalizedPoint === normalizedTitle)) {
+          return { key, drawer: value as any };
+        }
+      }
+      return null;
+    };
     const pointSummaryText = Object.entries(pointCounter)
       .sort((a, b) => b[1] - a[1])
       .slice(0, 8)
       .map(([point]) => {
-        const drawer = (drawerByTag as any)?.[point] || {};
+        const resolved = resolveDrawerByKnowledgePoint(point);
+        const drawer = resolved?.drawer || {};
         const summary = String(drawer?.summary || '').replace(/\s+/g, ' ').slice(0, 120);
         const markdown = String(drawer?.markdown || '').replace(/\s+/g, ' ').slice(0, 120);
-        return `${point}：总结=${summary || '暂无'}；补充=${markdown || '暂无'}`;
+        const tagId = String(drawer?.tag_id || '').trim() || '未记录';
+        const nodeId = String(drawer?.node_id || '').trim() || '未记录';
+        return `${point}（key=${resolved?.key || '未匹配'}，tag_id=${tagId}，node_id=${nodeId}）：总结=${summary || '暂无'}；补充=${markdown || '暂无'}`;
       })
       .join('\n');
       
@@ -4246,18 +4608,17 @@ function buildAiSystemPrompt() {
 2. 只能从给定知识点列表中选择，不允许新增分类
 3. 始终用中文回复，语气友好专业
 4. JSON中不要有注释，确保是合法JSON格式
-5. note 必须高效、直击痛点，拒绝任何废话和死板套路。不需要硬性使用“步骤1/2/3”等固定模板，灵活根据错题情况组织，但必须包含核心信息：
-   - 考查知识点：明确本题考查的核心。
-   - 错因分析：直接指出为什么错，点出思维误区或规则冲突。
-   - 核心解析：根据题干关键信息（题眼词、关键代码等）直接给出推导逻辑和结论。
+5. note 必须高效、直击痛点，拒绝任何废话和死板套路。不需要任何固定模板或固定小标题，直接根据题目给出清晰可编辑的自然语言解析即可，但要覆盖：本题考查点、为什么会错、以及基于题干证据的正确推导与结论。
 6. 禁止空泛措辞，如“需要严格按照定义”“一步步推导即可”等未落到本题证据的话；禁止输出像“步骤二：规则匹配”这样机械化的废话标题。`;
 }
 
-const AI_COPILOT_PROMPT = `你是“全能AI学伴”，只能处理学习相关请求：错题解答、错题入库、复习建议、练习建议。
+const AI_COPILOT_BASE_RULES = `你是“全能AI学伴”，只能处理学习相关请求：错题解答、错题入库、复习建议、练习建议。
 你会在用户消息中收到“对用户展示的能力”和“当前内部模式”，必须优先遵守前台能力边界：录入整理只处理错题草稿、知识点整理与结构修订；讲解追问只处理讲解、比较、错因分析与追问；计划推荐只提供学习建议、范围判断与下一步安排；跳转启动只负责生成 handoff card 并跳转到正式页面。
-如果用户只是简单的打招呼（如“你好”、“在吗”等）或日常闲聊，请简短友好地回复，**不需要**进行深度思考，也**不需要**背诵规则或提及你的能力清单。
+默认模式是“讲解”，系统不会再自动识别模式。你必须严格按当前模式执行：在讲解/推荐模式下只能讲解与建议，不能输出任何写动作。
+当你判断用户可能需要“错题入库/知识点更新/错题修改”时：若当前能力是讲解/计划推荐，先给一句简短建议并提示切换到录入整理；若当前能力已是录入整理，直接输出可执行卡片，不要再追问“是否入库”。
+如果用户只是简单的打招呼（如“你好”、“在吗”等）或日常闲聊，请简短友好地回复，**不需要**进行深度思考，也**不需要**背诵规则或提及你的能力清单。`;
 
-输出规则：             
+const AI_COPILOT_INGEST_RULES = `输出规则：
 1. 先输出给用户看的中文讲解。
 2. 如果需要执行动作，必须在最末尾直接输出 <ACTION>...</ACTION>。注意：
   - \`<ACTION>\` 标签必须在最外层，绝不能被 \` \`\`\`json \` 等 Markdown 代码块包裹！
@@ -4265,29 +4626,30 @@ const AI_COPILOT_PROMPT = `你是“全能AI学伴”，只能处理学习相关
   - JSON 字符串内的换行必须使用转义字符 \\n，绝对不要输出真实的换行符！
   - 不要向用户展示任何执行动作的 JSON 代码。
   - 允许的 type 如下：
-  - create_mistake: 生成待确认错题草稿，而不是直接执行入库。payload 可以是单题对象，也可以使用 questions 数组一次给出多题草稿。每道题都必须只给 1 个最终 knowledge_point，且 subject(如英语/C语言)、question_text(题干)、knowledge_point、note、correct_answer 必须完整。note 必须包含【考查知识点】【错因分析】【核心解析】三段；summary 可为空，不要强行给每题预置总结。不再需要 mistake_point。如果是选择题，必须额外提供 options 数组（如 ["A. 选项1", "B. 选项2"]），并确保 question_text 纯净且不包含选项。若成功提取了文本和选项，你可以设置 "image_url": "" 来丢弃原始图片。
+  - create_mistake: 生成待确认错题草稿，而不是直接执行入库。payload 可以是单题对象，也可以使用 questions 数组一次给出多题草稿。每道题都必须只给 1 个最终 knowledge_point，且 subject(如英语/C语言)、question_text(题干)、knowledge_point、note、correct_answer 必须完整。note 只要求“非空且可直接编辑”，禁止强制固定模板；summary 可为空，不要强行给每题预置总结。不再需要 mistake_point。如果是选择题，必须额外提供 options 数组（如 ["A. 选项1", "B. 选项2"]），并确保 question_text 纯净且不包含选项。若成功提取了文本和选项，你可以设置 "image_url": "" 来丢弃原始图片。
   - update_tags: 更新错题标签或内容。payload 必须包含 question_id，且 question_id 必须来自“最近错题样本”中的 ID。
    - start_review: 开始复习。payload必须包含: preset({ subject(必须单一学科，禁止混合英语与C语言), strategy(due_rescue/stubborn_focus/unmastered_boost/custom), scope(due/all/unmastered/stubborn), amount(建议10-20), sortBy(nearestDue/lowestMastery/latestWrong) })。优先输出“分包任务”语义，用小任务包描述本轮计划。
    - start_drill: 专项练习。payload必须包含: preset({ subject, nodes(知识点数组), amount, strategy(递进/随机/攻坚) })。
+  - render_inline_quiz: 当用户要求出少量（小于等于 5 道）测试题、小测验时，使用 render_inline_quiz 动作返回结构化的题目数据，而不要使用 start_drill。题干、选项必须结构化，并提供正确答案和深入的解析。payload 必须包含: quiz_id(唯一标识), questions(数组，每题包含: id, subject, knowledge_point, question_text, options, correct_answer, explanation)。
   - delete_mistake: 删除特定错题。payload 必须包含 question_id，且 question_id 必须来自“最近错题样本”中的 ID。
-  - update_learning_content: 智能更新知识点的 Markdown 总结内容。必须采用“知识浓缩”策略：将新规律归并为结构化的高质量 Markdown。排版必须像高质量教材/手写笔记：先按主题分组，再按子知识点展开。使用 \`###\` 作为一级分组标题；当知识点体量较大（例如 C 语言-结构体）时，在组内继续使用 \`####\` 拆分子点（如定义语法、内存布局、访问方式、典型陷阱）。每个标题下用短横线 bullet(-) 写要点，不要空话。允许保留“### 易错规律”用于集中列坑点。不要强制“解题方法/判断线索”固定模板，要根据知识点本身自然分类。直接用你最好的总结重写并覆盖已有内容，保持 Markdown 简洁、结构化。当用户批量提供跨标签的知识点时，你可以返回一个 update_learning_content 动作，并在 payload.updates 中提供一个数组。如果是更新单个知识点，可以在 payload 中直接给出 node/tag 和 markdown。若能判断更新性质，额外提供 decision(skip/rewrite/create) 与 reason，帮助前端展示“无需更新 / 建议改写 / 建议新增”的说明。
-3. 默认策略是“先建议再执行”，所以动作只产出待确认草稿，不表示已执行。
+  - update_learning_content: 智能更新知识点的 Markdown 总结内容。必须采用“知识浓缩”策略：将新规律归并为结构化的高质量 Markdown。允许自由结构，不要强制固定模板，不要自动补“考点/易错规律/常见知识点”等固定分区。输出的 markdown 必须包含“原有有效内容 + 本次新增规律”的融合结果，优先同类合并与去重，避免把旧内容整体删掉。当用户批量提供跨标签的知识点时，你可以返回一个 update_learning_content 动作，并在 payload.updates 中提供一个数组。如果是更新单个知识点，可以在 payload 中直接给出 node/tag 和 markdown。若能判断更新性质，额外提供 decision(skip/rewrite/create) 与 reason，帮助前端展示“无需更新 / 建议改写 / 建议新增”的说明。
+3. 若当前能力是录入整理，默认策略是“直接产出可执行卡片（待前端确认执行）”；若当前能力不是录入整理，再采用“先建议再执行”。
 4. 高风险动作 risk 必须为 "high"。
 5. 仅学习域；若用户闲聊或越界，礼貌拒绝并引导到复习或练习动作。
-6. 若当前能力不是跳转启动，禁止主动输出完整复习正文或完整专项练习正文；最多只保留轻量 CTA。若当前能力是计划推荐，也只给建议与理由，不直接创建正式会话。
-7. 当用户要求改写“提分锦囊”或“知识点抽屉”内容时，或者用户主动提供知识点要求记录时，使用 update_learning_content，并在 payload 中给出 node/tag、markdown，或者使用 updates 数组批量更新多个知识点。直接用你最好的总结重写并覆盖已有内容，保持 Markdown 简洁结构化。
+6. 若当前能力不是跳转启动，禁止主动输出完整复习正文或完整专项练习正文；最多只保留轻量 CTA。若当前能力是计划推荐，也只给建议与理由，不直接创建正式会话。若当前能力是讲解，也禁止输出写动作。
+7. 当用户要求改写“提分锦囊”或“知识点抽屉”内容时，或者用户主动提供知识点要求记录时，使用 update_learning_content，并在 payload 中给出 node/tag、markdown，或者使用 updates 数组批量更新多个知识点。默认采用“增量融合”策略：在保留已有有效信息的基础上合并新规律并去重，保持 Markdown 简洁结构化。
 8. 你会收到“学习档案快照（系统提供，可信）”，必须优先依据该快照回答“我有哪些弱点/错题在哪些板块”。
 9. 只有当快照里“错题总数=0”时，才能说“暂无错题”；否则必须给出分布、Top弱点、优先复习建议。
 10. 若动作为 create_mistake 或 update_tags 且包含 note，note 必须采用高效简洁的结构，抛弃硬性的步骤1/2/3。每一点解析都必须引用本题证据词（如 by the time、starts、if 从句等）。
-11. 禁止输出模板化废话，优先给出“题眼/关键信息 → 规则 → 结论”的高密度解析。若生成 start_review，说明文案要写成“专项任务包/分包任务”，避免“全量一次做完”的措辞。
+11. 禁止输出模板化废话，优先给出“题眼/关键信息 → 规则 → 结论”的高密度解析。若生成 start_review，说明文案要写成“专项任务包/分包任务”，避免“全量一次做完”的措辞。对于 render_inline_quiz 的 explanation，禁止使用“本题考查了…”、“建议复习…”等套话，必须直击用户的错因和正确答案依据。
 12. 标签必须精确：knowledge_point、ability、error_type 必须从系统给定标签库中挑最贴近项；如果拿不准，也只能给出 1 个最接近的主知识点，不能同时输出多个最终知识点。
-13. 每次建议 create_mistake 或 update_tags 时，都要额外给出 update_learning_content 所需内容；但若本轮核心目标是入库错题，必须优先输出 create_mistake / update_tags，不要仅输出 update_learning_content。learning_updates 中若能判断更新性质，也额外补充 decision(skip/rewrite/create) 与 reason。
+13. 在录入整理模式下，每次建议 create_mistake 或 update_tags 时，都要额外给出 update_learning_content 所需内容；但若本轮核心目标是入库错题，必须优先输出 create_mistake / update_tags，不要仅输出 update_learning_content。learning_updates 中若能判断更新性质，也额外补充 decision(skip/rewrite/create) 与 reason。
 14. 当修改知识点内容（update_learning_content）或总结错题时，请基于题干证据、错因与解析进行归纳，不依赖 mistake_point 字段。
 15. 若输出 update_learning_content，markdown 应面向“长期可维护的完整知识点结构”：同概念合并、跨题抽象、去重表达，避免“每题一段新增补充”。
-16. update_learning_content 的 payload 必须包含 markdown（或者 updates 数组），直接给出完整的、结构化的高质量 Markdown 内容，取代现有的知识点内容。
-17. Markdown 必须按子知识点（如“### 语法结构 / ### 适用场景 / ### 易错点”等）归类，用短横线 bullet(-) 罗列要点。禁止添加任何“这是知识点总结”之类冗余大标题；内容直接从知识点分类开始。
-18. 摒弃过去“每题一个新增错题沉淀”的追加模式。收到新错题时，请把新规律融入对应的结构化模块中，同类合并，去重去冗。
-19. 当用户对“待入库草稿”提出不满意/补充要求时，优先重新输出 create_mistake 来覆盖草稿，不要只给解释性文字；并保证每题 note 补齐。 
+16. update_learning_content 的 payload 必须包含 markdown（或者 updates 数组），直接给出完整的、结构化的高质量 Markdown 内容，作为“融合后版本”提交，确保包含历史有效要点与本次新增规律。
+17. Markdown 可按内容自由组织，重点是结构清晰、信息可维护；不要强制统一骨架模板，也不要自动补固定栏目。
+18. 不要机械地“每题单独一段”追加。收到新错题时，请把新规律融入对应的结构化模块中，同类合并，去重去冗，同时保留仍然有效的历史知识点。
+19. 当用户对“待入库草稿”提出不满意/补充要求时（且当前是录入整理模式），优先重新输出 create_mistake 来覆盖草稿，不要只给解释性文字；并保证每题 note 补齐。 
 
 ACTION JSON格式：
 <ACTION>
@@ -4303,7 +4665,7 @@ ACTION JSON格式：
         "question_text": "He ____ (work) here since 2010.",
         "correct_answer": "has worked",
         "knowledge_point": "时态",
-        "note": "【考查知识点】现在完成时\n【错因分析】忽略了 since\n【核心解析】since + 过去时间点，主句用现在完成时。"
+        "note": "题眼是 since + 过去时间点。错在把持续到现在的动作当成一般过去时。正确应使用 has/have done，因此答案是 has worked。"
       }
     ],
     "learning_updates": [
@@ -4311,12 +4673,14 @@ ACTION JSON格式：
         "tag": "时态",
         "decision": "rewrite",
         "reason": "本题补充了 since + 过去时间点 的稳定判定线索，需要重写到时态笔记中",
-        "markdown": "### 现在完成时\n- 看到 since + 过去时间点，主句必选 has/have done。"
+        "markdown": "### 现在完成时基本用法\n- 看到 since + 过去时间点，主句优先判断为 has/have done。"
       }
     ]
   }
 }
 </ACTION>`;
+
+const AI_COPILOT_PROMPT = `${AI_COPILOT_BASE_RULES}\n\n${AI_COPILOT_INGEST_RULES}`;
 
 function downloadJson(filename: string, data: unknown) {
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
@@ -4484,17 +4848,87 @@ export const chatApi = {
     },
   ) => {
     await hydrateTagDictionaryOnce();
-    const controller = new AbortController();
-    if (options?.signal) {
-      options.signal.addEventListener('abort', () => controller.abort());
+    const normalizeMessageContent = (rawContent: unknown): string | Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } }> => {
+      if (Array.isArray(rawContent)) {
+        const normalizedParts = rawContent.reduce<Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } }>>((parts, part) => {
+          if (!part || typeof part !== 'object') return parts;
+          const rawType = String((part as any).type || '').trim();
+          if (rawType === 'text') {
+            const text = String((part as any).text || '').trim();
+            if (text) parts.push({ type: 'text', text });
+            return parts;
+          }
+          if (rawType === 'image_url') {
+            const imageUrl = String((part as any).image_url?.url || (part as any).url || '').trim();
+            if (imageUrl) parts.push({ type: 'image_url', image_url: { url: imageUrl } });
+            return parts;
+          }
+          return parts;
+        }, []);
+        return normalizedParts.length > 0 ? normalizedParts : '';
+      }
+      if (rawContent == null) return '';
+      if (typeof rawContent === 'string') return rawContent;
+      if (typeof rawContent === 'number' || typeof rawContent === 'boolean' || typeof rawContent === 'bigint') {
+        return String(rawContent);
+      }
+      if (typeof rawContent === 'object') {
+        const rawType = String((rawContent as any).type || '').trim();
+        if (rawType === 'text') {
+          const text = String((rawContent as any).text || '').trim();
+          return text || '';
+        }
+        if (rawType === 'image_url') {
+          const imageUrl = String((rawContent as any).image_url?.url || (rawContent as any).url || '').trim();
+          return imageUrl ? [{ type: 'image_url', image_url: { url: imageUrl } }] : '';
+        }
+        return '';
+      }
+      return String(rawContent);
+    };
+    const normalizedMessages = (Array.isArray(messages) ? messages : []).map((item) => {
+      const role = String(item?.role || '').trim();
+      const normalizedRole = role === 'assistant' || role === 'system' || role === 'tool' ? role : 'user';
+      return {
+        role: normalizedRole,
+        content: normalizeMessageContent(item?.content),
+      };
+    }).filter((item) => {
+      if (Array.isArray(item.content)) return item.content.length > 0;
+      return String(item.content || '').trim().length > 0;
+    });
+    let guard:
+      | {
+          release: (outcome: 'success' | 'failed') => void;
+        }
+      | null = null;
+    try {
+      guard = acquireAiRequestGuard({
+        key: buildChatGuardKey({
+          model: options?.model || (import.meta as any).env?.VITE_QWEN_MODEL || 'qwen3.5-plus',
+          systemPrompt: options?.systemPrompt || buildAiSystemPrompt(),
+          enableThinking: options?.enableThinking,
+          messages: normalizedMessages,
+        }),
+        duplicateWindowMs: AI_CHAT_DUPLICATE_WINDOW_MS,
+      });
+    } catch (err) {
+      onError(mapAiGuardErrorMessage(err));
+      return;
     }
-    // Increase timeout to 120 seconds (120000ms) to accommodate long deep thinking times
-    const timeout = setTimeout(() => controller.abort(), 120000);
+    const controller = new AbortController();
+    let sourceAbortHandler: (() => void) | null = null;
+    if (options?.signal) {
+      sourceAbortHandler = () => controller.abort();
+      options.signal.addEventListener('abort', sourceAbortHandler, { once: true });
+    }
+    const timeout = setTimeout(() => controller.abort(), AI_STREAM_TIMEOUT_MS);
 
     try {
       const { data: { session } } = await supabase.auth.getSession();
       if (!session?.access_token) {
         onError('登录状态已失效，请重新登录后再试');
+        guard.release('failed');
         return;
       }
 
@@ -4510,7 +4944,7 @@ export const chatApi = {
           model: options?.model || (import.meta as any).env?.VITE_QWEN_MODEL || 'qwen3.5-plus',
           messages: [
             { role: 'system', content: options?.systemPrompt || buildAiSystemPrompt() },
-            ...messages
+            ...normalizedMessages
           ],
           stream: true,
           ...(options?.enableThinking ? { enable_thinking: true } : {})
@@ -4521,6 +4955,7 @@ export const chatApi = {
       if (!response.ok) {
         const errText = await response.text();
         onError(`AI代理请求失败: ${errText}`);
+        guard.release('failed');
         return;
       }
 
@@ -4528,6 +4963,7 @@ export const chatApi = {
       const decoder = new TextDecoder();
       let buffer = '';
       let fullContent = '';
+      let reasoningLength = 0;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -4539,6 +4975,7 @@ export const chatApi = {
           if (line.startsWith('data: ')) {
             const raw = line.slice(6).trim();
             if (raw === '[DONE]') {
+              guard.release('success');
               onComplete(fullContent);
               return;
             }
@@ -4546,27 +4983,43 @@ export const chatApi = {
               const parsed = JSON.parse(raw);
               const reasoningContent = parsed.choices?.[0]?.delta?.reasoning_content;
               if (reasoningContent && options?.onReasoningChunk) {
+                reasoningLength += String(reasoningContent).length;
+                if (reasoningLength > AI_STREAM_MAX_REASONING_CHARS) {
+                  throw new Error('ai_guard_reasoning_too_long');
+                }
                 options.onReasoningChunk(reasoningContent);
               }
               const content = parsed.choices?.[0]?.delta?.content;
               if (content) {
                 fullContent += content;
+                if (fullContent.length > AI_STREAM_MAX_CONTENT_CHARS) {
+                  throw new Error('ai_guard_content_too_long');
+                }
                 onChunk(content);
               }
-            } catch {
-              // ignore parse errors
+            } catch (err: any) {
+              if (String(err?.message || '').startsWith('ai_guard_')) {
+                throw err;
+              }
             }
           }
         }
       }
+      guard.release('success');
       onComplete(fullContent);
     } catch (err) {
-      const errorText = err instanceof Error && err.name === 'AbortError'
-        ? '网络请求超时，请重试'
-        : `网络请求失败: ${err}`;
+      guard.release('failed');
+      const isAbortError = err instanceof Error && err.name === 'AbortError';
+      const abortReason = isAbortError ? String((controller.signal as any)?.reason || '') : '';
+      const errorText = isAbortError
+        ? (abortReason === 'user_cancel' ? '已取消本次生成' : '网络请求超时，请重试')
+        : mapAiGuardErrorMessage(err) || `网络请求失败: ${err}`;
       onError(errorText);
     } finally {
       clearTimeout(timeout);
+      if (options?.signal && sourceAbortHandler) {
+        options.signal.removeEventListener('abort', sourceAbortHandler);
+      }
     }
   },
   streamCopilot: async (
