@@ -6,7 +6,7 @@ import { Sparkles, ArrowRight, Plus, Pencil, Trash2, X, Download, TriangleAlert,
 
 import { getKnowledgeNodeMeta, getKnowledgePointsBySubjectFromTaxonomy, hydrateTaxonomyOverridesFromCloud, registerCustomKnowledgeTaxonomy } from '../lib/knowledgeTaxonomy';
 import { approveNewTags, getTagExtensionsSnapshot, hydrateTagExtensionsFromCloud, removeTagExtension, renameTagExtension } from '../lib/copilot';
-import { moveNodeTag, renameNodeTag, syncDeleteCategory, syncDeleteNodeTag } from '../lib/tagTreeService';
+import { moveNodeTag, renameNodeTag, syncDeleteCategory, syncDeleteNodeTag, syncRenameCategory } from '../lib/tagTreeService';
 import { ReactSortable } from 'react-sortablejs';
 import { getLearningSyncSnapshot, subscribeLearningSyncSnapshot, type LearningSyncSnapshot } from '../lib/learningSyncStatus';
 import { toast } from 'sonner';
@@ -694,16 +694,12 @@ export function MistakeBookPage() {
     }
     try {
       const startedAt = performance.now();
-      await Promise.all(nodeNames.map((nodeName) => {
-        const meta = getKnowledgeNodeMeta(subject as Subject, nodeName);
-        return registerCustomKnowledgeTaxonomy(nodeName, normalizedNext, meta.branch || '默认分类', subject);
-      }));
-      const affectedIds = questions
-        .filter((item) => getKnowledgeNodeMeta(subject as Subject, item.knowledge_point).category === normalizedOld)
-        .map((item) => item.id);
-      if (affectedIds.length > 0) {
-        await questionsApi.batchUpdate(affectedIds, { category: normalizedNext });
-      }
+      await syncRenameCategory({
+        subject,
+        oldCategory: normalizedOld,
+        nextCategory: normalizedNext,
+        questions,
+      });
       setSortConfig((prev) => {
         const next = { ...prev };
         Object.keys(prev).forEach((key) => {

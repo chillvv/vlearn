@@ -92,3 +92,33 @@ export async function syncDeleteCategory(input: TagTreeMutationInput & {
     });
   }
 }
+
+export async function syncRenameCategory(input: TagTreeMutationInput & {
+  oldCategory: string;
+  nextCategory: string;
+}) {
+  const oldCategory = String(input.oldCategory || '').trim();
+  const nextCategory = String(input.nextCategory || '').trim();
+  if (!oldCategory || !nextCategory || oldCategory === nextCategory) return;
+
+  const nodeNames = Array.from(new Set(
+    input.questions
+      .filter((q) => getKnowledgeNodeMeta(input.subject, q.knowledge_point).category === oldCategory)
+      .map((q) => String(q.knowledge_point || '').trim())
+      .filter(Boolean),
+  ));
+
+  if (nodeNames.length > 0) {
+    await Promise.all(nodeNames.map((nodeName) => {
+      const meta = getKnowledgeNodeMeta(input.subject, nodeName);
+      return registerCustomKnowledgeTaxonomy(nodeName, nextCategory, meta.branch || '默认分类', input.subject);
+    }));
+  }
+
+  const affectedIds = input.questions
+    .filter((q) => getKnowledgeNodeMeta(input.subject, q.knowledge_point).category === oldCategory)
+    .map((q) => q.id);
+  if (affectedIds.length > 0) {
+    await questionsApi.batchUpdate(affectedIds, { category: nextCategory });
+  }
+}
