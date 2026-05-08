@@ -17,6 +17,7 @@
 - `DraftReviewPage.tsx` 再次减重：选项解析与预览题干拼装下沉到 `draftImportPolicy.ts`。
 - `draftImportPolicy.ts` 新增 `resolveDraftOptionLines` 与 `buildDraftPreviewTextForStorage`，统一页面与入库前逻辑。
 - `MistakeBookPage.tsx` 再次减重：分类重命名后台同步下沉到 `tagTreeService.syncRenameCategory`。
+- `DraftReviewPage.tsx` 再次减重：动作目标题目 ID 解析下沉到 `draftActionResolver.ts`。
 - 已验证：`npm run test:acceptance:draft-import`、`npm run typecheck` 通过。
 
 ## 下一步建议

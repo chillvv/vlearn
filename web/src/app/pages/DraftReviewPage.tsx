@@ -34,6 +34,7 @@ import { getKnowledgePointsBySubjectFromTaxonomy, inferKnowledgeNodeMetaForNewTa
 import { buildCopilotModePrompt, getCopilotCapabilityMeta, getCopilotModeMeta, inferCopilotCapability, isActionAllowedForMode, normalizeDrillPreset, normalizeReviewPreset, type CopilotCapability, type CopilotMode } from '../lib/copilotMode';
 import { buildDraftIngestionBuckets, loadDraftIngestionBucketContext, runUnifiedDuplicateGuard, type DraftIngestionBucket, type DraftIngestionBucketContext, type DuplicateGuardResult } from '../lib/mistakeIngestion';
 import { matchesQuestionIdentifier } from '../lib/entityIds';
+import { resolveQuestionIdFromActionPayload } from '../lib/draftActionResolver';
 import { buildLearningSessionNavigation, createLearningSessionProposal } from '../lib/learningSession';
 import 'katex/dist/katex.min.css';
 
@@ -722,49 +723,6 @@ ${capabilityInstruction}
     };
   };
 
-  const normalizeQuestionIdentityText = (value: unknown) => String(value || '').replace(/[\s\p{P}]/gu, '').toLowerCase();
-  const resolveQuestionIdFromActionPayload = async (action: CopilotActionProposal, drafts?: DraftQuestion[]) => {
-    const payload = action.payload || {};
-    const directCandidates = [
-      payload?.question_id,
-      payload?.questionId,
-      payload?.id,
-      payload?.mistake_id,
-      payload?.mistakeId,
-      Array.isArray(payload?.questions) ? payload.questions[0]?.question_id : undefined,
-      Array.isArray(payload?.questions) ? payload.questions[0]?.id : undefined,
-    ].map((item) => String(item || '').trim()).filter(Boolean);
-    if (directCandidates.length > 0) {
-      const target = directCandidates.find((item) => isUuidLike(item));
-      if (target) return target;
-      return directCandidates[0];
-    }
-    const allQuestions = await questionsApi.getAll();
-    const textCandidates = [
-      payload?.question_text,
-      payload?.questionText,
-      Array.isArray(payload?.questions) ? payload.questions[0]?.question_text : undefined,
-      Array.isArray(payload?.questions) ? payload.questions[0]?.questionText : undefined,
-      drafts?.[0]?.question_text,
-    ]
-      .map((item) => String(item || '').trim())
-      .filter(Boolean);
-    for (const candidate of textCandidates) {
-      const normalized = normalizeQuestionIdentityText(candidate);
-      if (normalized.length < 6) continue;
-      const matches = allQuestions.filter((question) => {
-        if (directCandidates.some((candidate) => matchesQuestionIdentifier(question, candidate))) {
-          return true;
-        }
-        const target = normalizeQuestionIdentityText(question.question_text);
-        if (!target) return false;
-        return target.includes(normalized) || normalized.includes(target);
-      });
-      if (matches.length === 1) return matches[0].id;
-    }
-    return '';
-  };
-
   const executeAction = async (
     action: CopilotActionProposal,
     drafts?: DraftQuestion[],
@@ -951,7 +909,13 @@ ${capabilityInstruction}
       return;
     }
     if (action.type === 'update_tags') {
-      const targetQuestionId = await resolveQuestionIdFromActionPayload(action, drafts);
+      const targetQuestionId = await resolveQuestionIdFromActionPayload({
+        action,
+        drafts,
+        getAllQuestions: () => questionsApi.getAll(),
+        matchesQuestionIdentifier,
+        isUuidLike,
+      });
       if (!targetQuestionId) {
         throw new Error('缺少可识别的 question_id，无法更新错题。请让 AI 在动作中携带 question_id。');
       }
@@ -1027,7 +991,13 @@ ${capabilityInstruction}
       return;
     }
     if (action.type === 'delete_mistake') {
-      const targetQuestionId = await resolveQuestionIdFromActionPayload(action, drafts);
+      const targetQuestionId = await resolveQuestionIdFromActionPayload({
+        action,
+        drafts,
+        getAllQuestions: () => questionsApi.getAll(),
+        matchesQuestionIdentifier,
+        isUuidLike,
+      });
       if (!targetQuestionId) {
         throw new Error('缺少可识别的 question_id，无法删除错题。请让 AI 在动作中携带 question_id。');
       }
