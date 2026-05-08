@@ -14,8 +14,8 @@ import {
   stripActionForStreaming,
 } from '../lib/copilot';
 import type { Question, Subject } from '../lib/types';
-import { formatQuestionTextForStorage, parseQuestionPreview } from '../lib/questionPreview';
-import { normalizeDraftForImportPolicy, validateDraftsBeforeImportPolicy } from '../lib/draftImportPolicy';
+import { parseQuestionPreview } from '../lib/questionPreview';
+import { buildDraftPreviewTextForStorage, normalizeDraftForImportPolicy, resolveDraftOptionLines, validateDraftsBeforeImportPolicy } from '../lib/draftImportPolicy';
 import { buildKnowledgeUpdatePreviewModel, mergeLearningDrawerContent, readLearningContentState, resolveLearningDrawerContentByTag, resolveLearningDrawerReferenceForUpdate, sanitizeKnowledgeMarkdownForStorage, writeLearningContentState } from '../lib/knowledgeContent';
 import { toast } from 'sonner';
 import { useConfirm } from '../components/business/ConfirmProvider';
@@ -602,24 +602,6 @@ ${capabilityInstruction}
     }).join('\n');
   };
 
-  const getDraftOptionLines = (draft: DraftQuestion) => {
-    if (Array.isArray(draft.options) && draft.options.length > 0) {
-      return draft.options.map((item) => String(item || '').trim()).filter(Boolean);
-    }
-    if (Array.isArray(draft.normalized_payload?.options) && draft.normalized_payload.options.length > 0) {
-      return draft.normalized_payload.options.map((item) => `${item.label}. ${item.text}`);
-    }
-    const parsed = parseQuestionPreview(String(draft.question_text || ''));
-    return parsed.options.map((item) => `${item.label}. ${item.text}`);
-  };
-
-  const buildDraftPreviewText = (draft: DraftQuestion) => {
-    const stem = String(draft.question_text || '').trim();
-    const optionLines = getDraftOptionLines(draft);
-    if (optionLines.length === 0) return stem;
-    return formatQuestionTextForStorage(stem, optionLines);
-  };
-
   const buildDraftQuestion = (raw: any, imageUrl?: string): DraftQuestion => {
     const questionText = String(raw?.question_text || '来自 AI 管家会话');
     const parsed = parseQuestionPreview(questionText);
@@ -670,7 +652,7 @@ ${capabilityInstruction}
   };
 
   const getMergedDraft = (draft: DraftQuestion, editKey: string): DraftQuestion => {
-    const baseOptions = getDraftOptionLines(draft);
+    const baseOptions = resolveDraftOptionLines(draft);
     const edited = draftEdits[editKey] || {};
     const mergedSubject = (edited.subject || draft.subject || '英语') === 'C语言' ? 'C语言' : '英语';
     const resolvedKnowledgePoint = String(edited.knowledge_point ?? draft.knowledge_point ?? '').trim();
@@ -1201,7 +1183,7 @@ ${capabilityInstruction}
       const indexedLabel = batchAbsoluteIndexes.map((value) => value + 1).join('、');
       const draftSnapshot = batchDrafts.map((draft, index) => ({
         index: batchAbsoluteIndexes[index] + 1,
-        question_text: buildDraftPreviewText(draft),
+        question_text: buildDraftPreviewTextForStorage(draft),
         knowledge_point: draft.knowledge_point || '',
         subject: draft.subject || '英语',
         correct_answer: draft.correct_answer || '',
@@ -2169,8 +2151,8 @@ ${JSON.stringify(mergedDrafts, null, 2)}`;
                                           const editKey = `${idx}-${absoluteIdx}`;
                                           const mergedDraft = getMergedDraft(draft as DraftQuestion, editKey);
                                           const parsedOriginalQuestion = parseQuestionPreview(String(mergedDraft.question_text || ''));
-                                          const optionLines = getDraftOptionLines(mergedDraft);
-                                          const previewQuestionText = buildDraftPreviewText(mergedDraft);
+                                          const optionLines = resolveDraftOptionLines(mergedDraft);
+                                          const previewQuestionText = buildDraftPreviewTextForStorage(mergedDraft);
                                           const subject = String(mergedDraft.subject || '英语');
                                           const knowledgeOptions = getKnowledgePointsBySubjectFromTaxonomy(subject as '英语' | 'C语言');
                                           const knowledgePoint = getSelectableValue(typeof mergedDraft.knowledge_point === 'string' ? mergedDraft.knowledge_point : undefined, knowledgeOptions);

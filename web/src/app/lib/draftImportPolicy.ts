@@ -4,7 +4,7 @@ import { getKnowledgePointsBySubjectFromTaxonomy } from './knowledgeTaxonomy';
 
 export type DraftQuestionForImport = Partial<Question> & { options?: string[] };
 
-function resolveOptionLines(draft: DraftQuestionForImport) {
+export function resolveDraftOptionLines(draft: DraftQuestionForImport) {
   if (Array.isArray(draft.options) && draft.options.length > 0) {
     return draft.options.map((item) => String(item || '').trim()).filter(Boolean);
   }
@@ -15,6 +15,13 @@ function resolveOptionLines(draft: DraftQuestionForImport) {
   return parsed.options.map((item) => `${item.label}. ${item.text}`);
 }
 
+export function buildDraftPreviewTextForStorage(draft: DraftQuestionForImport) {
+  const stem = String(draft.question_text || '').trim();
+  const optionLines = resolveDraftOptionLines(draft);
+  if (optionLines.length === 0) return stem;
+  return formatQuestionTextForStorage(stem, optionLines);
+}
+
 export function validateDraftsBeforeImportPolicy(items: DraftQuestionForImport[]) {
   const issues: string[] = [];
   items.forEach((draft, index) => {
@@ -23,7 +30,7 @@ export function validateDraftsBeforeImportPolicy(items: DraftQuestionForImport[]
     const subject = String(draft.subject || '英语') as '英语' | 'C语言';
     const knowledgePoint = String(draft.knowledge_point || '').trim();
     const validKnowledgePoints = getKnowledgePointsBySubjectFromTaxonomy(subject);
-    const optionLines = resolveOptionLines(draft);
+    const optionLines = resolveDraftOptionLines(draft);
     const note = String(draft.note || '').trim();
     if (!questionText) issues.push(`${label}缺少题干，请先补充再入库。`);
     if (!knowledgePoint || !validKnowledgePoints.includes(knowledgePoint)) issues.push(`${label}的知识点必须从标签库中选择。`);
@@ -34,7 +41,7 @@ export function validateDraftsBeforeImportPolicy(items: DraftQuestionForImport[]
 }
 
 export function normalizeDraftForImportPolicy(draft: DraftQuestionForImport) {
-  const optionLines = resolveOptionLines(draft);
+  const optionLines = resolveDraftOptionLines(draft);
   const stem = String(draft.question_text || '').trim();
   return {
     ...draft,
